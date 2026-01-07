@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 from io import BytesIO
 from typing import Dict, Optional
@@ -79,47 +80,126 @@ def upload_to_s3(content: bytes, key: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload to S3: {str(e)}")
 
-def replace_in_paragraph(paragraph, placeholders: Dict[str, str]) -> bool:
-    """Replace placeholders in a paragraph, handling split runs."""
-    full_text = ''.join(run.text for run in paragraph.runs)
+def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -> bool:
+    """
+    Replace {{PLACEHOLDER}} patterns across run boundaries.
+    Handles Word's tendency to split text across multiple runs.
+    """
+    # Build full text and map character positions to runs
+    full_text = ""
+    char_to_run = []  # Maps each character index to (run_index, char_index_in_run)
     
+    for run_idx, run in enumerate(paragraph.runs):
+        for char_idx, char in enumerate(run.text):
+            char_to_run.append((run_idx, char_idx))
+        full_text += run.text
+    
+    if not full_text or "{{" not in full_text:
+        return False
+    
+    # Find all placeholders
     modified = False
-    for key, value in placeholders.items():
-        placeholder = "{{" + key + "}}"
-        if placeholder in full_text:
-            full_text = full_text.replace(placeholder, str(value))
-            modified = True
+    pattern = re.compile(r'\{\{([A-Z0-9_]+)\}\}')
     
-    if modified and paragraph.runs:
-        paragraph.runs[0].text = full_text
-        for run in paragraph.runs[1:]:
-            run.text = ""
+    # Process replacements from end to start (so positions stay valid)
+    matches = list(pattern.finditer(full_text))
+    for match in reversed(matches):
+        placeholder_key = match.group(1)
+        if placeholder_key in placeholders:
+            replacement = str(placeholders[placeholder_key])
+            start_pos = match.start()
+            end_pos = match.end()
+            
+            # Find which runs are affected
+            if char_to_run:  # Check we have characters to map
+                start_run_idx, start_char_idx = char_to_run[start_pos]
+                end_run_idx, end_char_idx = char_to_run[end_pos - 1]
+                
+                if start_run_idx == end_run_idx:
+                    # Placeholder is within a single run - simple case
+                    run = paragraph.runs[start_run_idx]
+                    run.text = run.text[:start_char_idx] + replacement + run.text[end_char_idx + 1:]
+                else:
+                    # Placeholder spans multiple runs
+                    # Put replacement in first run, clear the rest
+                    first_run = paragraph.runs[start_run_idx]
+                    last_run = paragraph.runs[end_run_idx]
+                    
+                    # Text before placeholder in first run + replacement
+                    first_run.text = first_run.text[:start_char_idx] + replacement
+                    
+                    # Text after placeholder in last run
+                    last_run.text = last_run.text[end_char_idx + 1:]
+                    
+                    # Clear runs in between
+                    for run_idx in range(start_run_idx + 1, end_run_idx):
+                        paragraph.runs[run_idx].text = ""
+                
+                modified = True
+                
+                # Rebuild the mapping for next iteration (since text changed)
+                full_text = ""
+                char_to_run = []
+                for run_idx, run in enumerate(paragraph.runs):
+                    for char_idx, char in enumerate(run.text):
+                        char_to_run.append((run_idx, char_idx))
+                    full_text += run.text
     
     return modified
 
-def replace_image_in_paragraph(paragraph, images: Dict[str, str]) -> bool:
-    """Replace image placeholders in a paragraph."""
-    full_text = ''.join(run.text for run in paragraph.runs)
+def replace_image_placeholders_in_paragraph(paragraph, images: Dict[str, str]) -> bool:
+    """Replace image placeholders in a paragraph, handling split runs."""
+    # Build full text to check for image placeholders
+    full_text = ""
+    char_to_run = []
     
-    for key, image_data in images.items():
-        placeholder = "{{" + key + "}}"
-        if placeholder in full_text:
-            # Clear the paragraph text
-            for run in paragraph.runs:
-                run.text = ""
+    for run_idx, run in enumerate(paragraph.runs):
+        for char_idx, char in enumerate(run.text):
+            char_to_run.append((run_idx, char_idx))
+        full_text += run.text
+    
+    if not full_text or "{{IMAGE_" not in full_text:
+        return False
+    
+    # Find image placeholders
+    pattern = re.compile(r'\{\{(IMAGE_[A-Z0-9_]+)\}\}')
+    matches = list(pattern.finditer(full_text))
+    
+    for match in reversed(matches):
+        placeholder_key = match.group(1)
+        if placeholder_key in images:
+            start_pos = match.start()
+            end_pos = match.end()
             
-            # Decode the base64 image
-            try:
-                image_bytes = base64.b64decode(image_data)
-                image_stream = BytesIO(image_bytes)
+            # Find which runs are affected
+            if char_to_run:
+                start_run_idx, start_char_idx = char_to_run[start_pos]
+                end_run_idx, end_char_idx = char_to_run[end_pos - 1]
                 
-                # Add the image to the first run
-                width = IMAGE_WIDTHS.get(key, 6.0)
-                paragraph.runs[0].add_picture(image_stream, width=Inches(width))
+                # Clear the placeholder text
+                if start_run_idx == end_run_idx:
+                    run = paragraph.runs[start_run_idx]
+                    run.text = run.text[:start_char_idx] + run.text[end_char_idx + 1:]
+                else:
+                    first_run = paragraph.runs[start_run_idx]
+                    last_run = paragraph.runs[end_run_idx]
+                    first_run.text = first_run.text[:start_char_idx]
+                    last_run.text = last_run.text[end_char_idx + 1:]
+                    for run_idx in range(start_run_idx + 1, end_run_idx):
+                        paragraph.runs[run_idx].text = ""
                 
-                return True
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Failed to decode image {key}: {str(e)}")
+                # Decode and insert image
+                try:
+                    image_bytes = base64.b64decode(images[placeholder_key])
+                    image_stream = BytesIO(image_bytes)
+                    
+                    # Add the image to the first affected run
+                    width = IMAGE_WIDTHS.get(placeholder_key, 6.0)
+                    paragraph.runs[start_run_idx].add_picture(image_stream, width=Inches(width))
+                    
+                    return True
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to decode image {placeholder_key}: {str(e)}")
     
     return False
 
@@ -127,9 +207,18 @@ def process_paragraphs(paragraphs, placeholders: Dict[str, str], images: Dict[st
     """Process paragraphs for text and image replacements."""
     for paragraph in paragraphs:
         # Try text replacement first
-        replace_in_paragraph(paragraph, placeholders)
+        replace_placeholders_in_paragraph(paragraph, placeholders)
         # Then try image replacement
-        replace_image_in_paragraph(paragraph, images)
+        replace_image_placeholders_in_paragraph(paragraph, images)
+
+def replace_placeholders_in_table(table, placeholders: Dict[str, str], images: Dict[str, str]) -> bool:
+    """Replace placeholders in all cells of a table."""
+    modified = False
+    for row in table.rows:
+        for cell in row.cells:
+            process_paragraphs(cell.paragraphs, placeholders, images)
+            modified = True
+    return modified
 
 def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: Dict[str, str]) -> bytes:
     """Fill the template with placeholders and images."""
@@ -140,16 +229,23 @@ def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: D
     
     # Process tables
     for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                process_paragraphs(cell.paragraphs, placeholders, images)
+        replace_placeholders_in_table(table, placeholders, images)
     
-    # Process headers and footers
+    # Process headers and footers for all section types
     for section in doc.sections:
-        # Header
-        process_paragraphs(section.header.paragraphs, placeholders, images)
-        # Footer
-        process_paragraphs(section.footer.paragraphs, placeholders, images)
+        # Process different header types
+        for header in [section.header, section.first_page_header, section.even_page_header]:
+            if header:
+                process_paragraphs(header.paragraphs, placeholders, images)
+                for table in header.tables:
+                    replace_placeholders_in_table(table, placeholders, images)
+        
+        # Process different footer types
+        for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
+            if footer:
+                process_paragraphs(footer.paragraphs, placeholders, images)
+                for table in footer.tables:
+                    replace_placeholders_in_table(table, placeholders, images)
     
     # Save to bytes
     output = BytesIO()
