@@ -126,6 +126,7 @@ Image placeholders: `{{IMAGE_*}}`
 
 - `IMAGE_SOURCES_USES` (6.5 inches)
 - `IMAGE_CAPITAL_STACK_CLOSING` (6.5 inches)
+- `IMAGE_LOAN_TO_COST` (6.0 inches)
 - `IMAGE_LTV_LTC` (6.0 inches)
 - `IMAGE_AERIAL_MAP` (5.0 inches)
 - `IMAGE_LOCATION_MAP` (5.0 inches)
@@ -133,3 +134,5 @@ Image placeholders: `{{IMAGE_*}}`
 - `IMAGE_SITE_PLAN` (5.5 inches)
 - `IMAGE_PILOT_SCHEDULE` (6.0 inches)
 - `IMAGE_TAKEOUT_SIZING` (6.0 inches)
+
+**Note:** All images are automatically scaled to fit within page constraints (max 6.5" width, 8.0" height) while preserving aspect ratio.
