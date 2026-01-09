@@ -2,7 +2,8 @@ import os
 import re
 import base64
 from io import BytesIO
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -11,6 +12,7 @@ import boto3
 from botocore.config import Config
 from docx import Document
 from docx.shared import Inches
+from PIL import Image
 
 app = FastAPI(title="IDS Template Filler", version="1.0.0")
 
@@ -29,7 +31,11 @@ s3_client = boto3.client(
     config=Config(s3={'addressing_style': 'path'})  # Handle dot in bucket name
 )
 
-# Image width configuration
+# Image dimension constraints
+MAX_WIDTH_INCHES = 6.5   # Content area of letter page with 1" margins
+MAX_HEIGHT_INCHES = 8.0  # Leave room for captions/spacing and prevent page breaks
+
+# Image width configuration (fallback values)
 IMAGE_WIDTHS = {
     "IMAGE_SOURCES_USES": 6.5,
     "IMAGE_CAPITAL_STACK_CLOSING": 6.5,
@@ -42,6 +48,47 @@ IMAGE_WIDTHS = {
     "IMAGE_PILOT_SCHEDULE": 6.0,
     "IMAGE_TAKEOUT_SIZING": 6.0,
 }
+
+def calculate_image_dimensions(image_bytes: bytes, preferred_width: float) -> Tuple[float, float]:
+    """
+    Calculate optimal image dimensions that fit within page constraints.
+    
+    Args:
+        image_bytes: The image data
+        preferred_width: Preferred width in inches
+        
+    Returns:
+        Tuple of (width_inches, height_inches) that maintains aspect ratio
+        and fits within page constraints
+    """
+    try:
+        # Get original image dimensions
+        image = Image.open(BytesIO(image_bytes))
+        original_width, original_height = image.size
+        
+        # Calculate original aspect ratio
+        aspect_ratio = original_height / original_width
+        
+        # Start with preferred width, but constrain to max width
+        width_inches = min(preferred_width, MAX_WIDTH_INCHES)
+        height_inches = width_inches * aspect_ratio
+        
+        # If height is too tall, scale down to fit max height
+        if height_inches > MAX_HEIGHT_INCHES:
+            height_inches = MAX_HEIGHT_INCHES
+            width_inches = height_inches / aspect_ratio
+            
+            # Make sure width still fits after height adjustment
+            if width_inches > MAX_WIDTH_INCHES:
+                width_inches = MAX_WIDTH_INCHES
+                height_inches = width_inches * aspect_ratio
+        
+        return width_inches, height_inches
+        
+    except Exception as e:
+        # Fallback to safe defaults if image processing fails
+        print(f"Warning: Could not process image dimensions: {e}")
+        return min(preferred_width, MAX_WIDTH_INCHES), min(4.0, MAX_HEIGHT_INCHES)
 
 class FillRequest(BaseModel):
     placeholders: Dict[str, str] = {}
@@ -66,6 +113,39 @@ def download_template(template_key: str) -> bytes:
         return response['Body'].read()
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Template not found: {template_key}")
+
+def get_unique_output_key(s3_client, bucket: str, output_key: str) -> str:
+    """
+    If output_key exists, return IDS_Generated_2.docx, _3.docx, etc.
+    """
+    # Check if file exists
+    try:
+        s3_client.head_object(Bucket=bucket, Key=output_key)
+    except:
+        # Doesn't exist, use as-is
+        return output_key
+    
+    # File exists - find next available number
+    base, ext = os.path.splitext(output_key)
+    
+    # Check if already has a number suffix
+    match = re.match(r'(.+)_(\d+)$', base)
+    if match:
+        base = match.group(1)
+        start = int(match.group(2)) + 1
+    else:
+        start = 2
+    
+    for i in range(start, 1000):
+        new_key = f"{base}_{i}{ext}"
+        try:
+            s3_client.head_object(Bucket=bucket, Key=new_key)
+        except:
+            return new_key
+    
+    # Fallback with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return f"{base}_{timestamp}{ext}"
 
 def upload_to_s3(content: bytes, key: str) -> str:
     """Upload content to S3 and return URL."""
@@ -188,18 +268,29 @@ def replace_image_placeholders_in_paragraph(paragraph, images: Dict[str, str]) -
                     for run_idx in range(start_run_idx + 1, end_run_idx):
                         paragraph.runs[run_idx].text = ""
                 
-                # Decode and insert image
+                # Decode and insert image with proper dimensions
                 try:
                     image_bytes = base64.b64decode(images[placeholder_key])
+                    
+                    # Calculate optimal dimensions that fit page constraints
+                    preferred_width = IMAGE_WIDTHS.get(placeholder_key, 6.0)
+                    width_inches, height_inches = calculate_image_dimensions(image_bytes, preferred_width)
+                    
+                    # Create fresh image stream for insertion
                     image_stream = BytesIO(image_bytes)
                     
-                    # Add the image to the first affected run
-                    width = IMAGE_WIDTHS.get(placeholder_key, 6.0)
-                    paragraph.runs[start_run_idx].add_picture(image_stream, width=Inches(width))
+                    # Add the image to the first affected run with calculated dimensions
+                    paragraph.runs[start_run_idx].add_picture(
+                        image_stream, 
+                        width=Inches(width_inches),
+                        height=Inches(height_inches)
+                    )
                     
+                    print(f"Inserted {placeholder_key}: {width_inches:.2f}\" x {height_inches:.2f}\"")
                     return True
+                    
                 except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Failed to decode image {placeholder_key}: {str(e)}")
+                    raise HTTPException(status_code=400, detail=f"Failed to process image {placeholder_key}: {str(e)}")
     
     return False
 
@@ -278,13 +369,17 @@ async def fill_and_upload_endpoint(request: FillAndUploadRequest):
     # Fill template
     filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
     
+    # Get unique filename if original exists
+    output_key = get_unique_output_key(s3_client, S3_BUCKET, request.output_key)
+    
     # Upload to S3
-    output_url = upload_to_s3(filled_bytes, request.output_key)
+    output_url = upload_to_s3(filled_bytes, output_key)
     
     return {
         "success": True,
-        "output_key": request.output_key,
-        "output_url": output_url
+        "output_key": output_key,  # Return actual filename used
+        "output_url": output_url,
+        "original_key": request.output_key  # Also return what was requested
     }
 
 if __name__ == "__main__":
