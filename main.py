@@ -53,6 +53,7 @@ IMAGE_WIDTHS = {
 FONT_NAME = "Times New Roman"
 FONT_SIZE_11PT = Pt(11)  # Default for all body text placeholders
 
+
 def calculate_image_dimensions(image_bytes: bytes, preferred_width: float) -> Tuple[float, float]:
     """
     Calculate optimal image dimensions that fit within page constraints.
@@ -94,11 +95,13 @@ def calculate_image_dimensions(image_bytes: bytes, preferred_width: float) -> Tu
         print(f"Warning: Could not process image dimensions: {e}")
         return min(preferred_width, MAX_WIDTH_INCHES), min(4.0, MAX_HEIGHT_INCHES)
 
+
 class FillRequest(BaseModel):
     placeholders: Dict[str, str] = {}
     images: Dict[str, str] = {}
     template_key: str = "_Templates/IDS_Template_Fairbridge.docx"
     output_filename: str = "IDS_Generated.docx"
+
 
 class FillAndUploadRequest(BaseModel):
     placeholders: Dict[str, str] = {}
@@ -106,9 +109,11 @@ class FillAndUploadRequest(BaseModel):
     template_key: str = "_Templates/IDS_Template_Fairbridge.docx"
     output_key: str
 
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
 
 def download_template(template_key: str) -> bytes:
     """Download template from S3."""
@@ -117,6 +122,7 @@ def download_template(template_key: str) -> bytes:
         return response['Body'].read()
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Template not found: {template_key}")
+
 
 def get_unique_output_key(s3_client, bucket: str, output_key: str) -> str:
     """
@@ -151,6 +157,7 @@ def get_unique_output_key(s3_client, bucket: str, output_key: str) -> str:
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     return f"{base}_{timestamp}{ext}"
 
+
 def upload_to_s3(content: bytes, key: str) -> str:
     """Upload content to S3 and return URL."""
     try:
@@ -164,37 +171,50 @@ def upload_to_s3(content: bytes, key: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload to S3: {str(e)}")
 
+
 def sanitize_text_content(text: str) -> str:
     """
     Clean up LLM-generated text content.
     - Replace 3+ newlines with 2 (single paragraph break)
+    - Replace multiple spaces with single space
     - Strip leading/trailing whitespace
     """
     if not text:
         return text
     # Replace 3+ newlines with 2 (single paragraph break)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # Strip leading/trailing whitespace
+    # Replace multiple spaces with single space
+    text = re.sub(r' {2,}', ' ', text)
+    # Strip leading/trailing whitespace from each line
+    lines = text.split('\n')
+    lines = [line.strip() for line in lines]
+    text = '\n'.join(lines)
+    # Strip leading/trailing whitespace from entire text
     text = text.strip()
     return text
 
+
 def apply_font_formatting(run, font_size: Pt, bold: bool = False):
-    """Apply font formatting to a run (used for SPONSOR_SECTION special formatting)."""
+    """Apply font formatting to a run."""
     run.font.name = FONT_NAME
     run.font.size = font_size
     run.font.bold = bold
+
 
 def apply_default_font_formatting(run):
     """Apply default 11pt Times New Roman formatting to a run."""
     run.font.name = FONT_NAME
     run.font.size = FONT_SIZE_11PT
 
+
 def format_sponsor_section_content(content: str, paragraph):
     """
     Format SPONSOR_SECTION content with special rules:
-    - First line (Sponsorship – [Grade]): 11pt Bold
-    - Company/sponsor name lines: 11pt Bold
+    - If first line starts with "Sponsorship", make it 11pt Bold
+    - Company/sponsor name lines (short, followed by longer text): 11pt Bold  
     - Bio/description paragraphs: 11pt Regular
+    
+    If content doesn't follow the expected structure, just apply regular formatting.
     """
     if not content:
         return
@@ -211,9 +231,13 @@ def format_sponsor_section_content(content: str, paragraph):
     if not lines:
         return
     
-    # Process first line (should be "Sponsorship – [Grade]")
-    first_run = paragraph.add_run(lines[0])
-    apply_font_formatting(first_run, FONT_SIZE_11PT, bold=True)
+    # Check if first line looks like "Sponsorship – [Grade]"
+    first_line = lines[0].strip()
+    first_line_is_sponsorship = first_line.lower().startswith("sponsorship")
+    
+    # Process first line
+    first_run = paragraph.add_run(first_line)
+    apply_font_formatting(first_run, FONT_SIZE_11PT, bold=first_line_is_sponsorship)
     
     # Process remaining lines
     i = 1
@@ -228,40 +252,33 @@ def format_sponsor_section_content(content: str, paragraph):
             continue
         
         # Heuristic to detect company/sponsor name headers:
-        # - Line is relatively short (< 80 chars)
-        # - Next non-empty line is significantly longer (at least 1.5x)
-        # - OR line looks like a name (contains common name patterns)
+        # Must meet ALL of these criteria:
+        # 1. Line is short (< 60 chars)
+        # 2. Does NOT end with sentence-ending punctuation
+        # 3. Contains at least one capital letter
+        # 4. Next non-empty line exists and is significantly longer (at least 2x)
         is_header = False
         
-        # Check if it looks like a name/company (contains capital letters, no sentence-ending punctuation)
-        looks_like_name = (
-            len(line) < 80 and
-            not line.endswith('.') and
-            not line.endswith('!') and
-            not line.endswith('?') and
-            any(c.isupper() for c in line)
-        )
+        line_length = len(line)
+        ends_with_punctuation = line.endswith('.') or line.endswith('!') or line.endswith('?') or line.endswith(':')
+        has_capitals = any(c.isupper() for c in line)
         
-        if looks_like_name:
-            # Look ahead to next non-empty line to confirm
+        if line_length < 60 and not ends_with_punctuation and has_capitals:
+            # Look ahead to next non-empty line
             for j in range(i + 1, len(lines)):
                 next_line = lines[j].strip()
                 if next_line:
-                    # If next line is much longer, this is likely a header
-                    if len(next_line) > len(line) * 1.5:
-                        is_header = True
-                    # If next line starts with lowercase or is a sentence, this is a header
-                    elif next_line and next_line[0].islower():
+                    # Only mark as header if next line is substantially longer
+                    if len(next_line) >= line_length * 2:
                         is_header = True
                     break
         
-        # Add the line
+        # Add line break before this line (since we're not the first line)
+        paragraph.add_run().add_break()
+        
+        # Add the line with appropriate formatting
         run = paragraph.add_run(line)
         apply_font_formatting(run, FONT_SIZE_11PT, bold=is_header)
-        
-        # Add line break if not last line
-        if i < len(lines) - 1:
-            paragraph.add_run().add_break()
         
         i += 1
     
@@ -269,6 +286,7 @@ def format_sponsor_section_content(content: str, paragraph):
     ppr = paragraph.paragraph_format
     ppr.line_spacing_rule = 1  # Single spacing
     ppr.space_after = Pt(0)  # No extra space after
+
 
 def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -> bool:
     """
@@ -363,15 +381,8 @@ def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -
                 run = paragraph.runs[run_idx]
                 apply_default_font_formatting(run)
     
-    # Set paragraph spacing properties for consistent formatting
-    if modified:
-        ppr = paragraph.paragraph_format
-        # Set line spacing: single spacing (lineRule="auto")
-        # This ensures consistent paragraph spacing
-        ppr.line_spacing_rule = 1  # Single spacing
-        ppr.space_after = Pt(0)  # No extra space after
-    
     return modified
+
 
 def replace_image_placeholders_in_paragraph(paragraph, images: Dict[str, str]) -> bool:
     """Replace image placeholders in a paragraph, handling split runs."""
@@ -440,6 +451,7 @@ def replace_image_placeholders_in_paragraph(paragraph, images: Dict[str, str]) -
     
     return False
 
+
 def process_paragraphs(paragraphs, placeholders: Dict[str, str], images: Dict[str, str]):
     """Process paragraphs for text and image replacements."""
     for paragraph in paragraphs:
@@ -447,6 +459,7 @@ def process_paragraphs(paragraphs, placeholders: Dict[str, str], images: Dict[st
         replace_placeholders_in_paragraph(paragraph, placeholders)
         # Then try image replacement
         replace_image_placeholders_in_paragraph(paragraph, images)
+
 
 def replace_placeholders_in_table(table, placeholders: Dict[str, str], images: Dict[str, str]) -> bool:
     """Replace placeholders in all cells of a table."""
@@ -456,6 +469,7 @@ def replace_placeholders_in_table(table, placeholders: Dict[str, str], images: D
             process_paragraphs(cell.paragraphs, placeholders, images)
             modified = True
     return modified
+
 
 def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: Dict[str, str]) -> bytes:
     """Fill the template with placeholders and images."""
@@ -490,6 +504,7 @@ def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: D
     output.seek(0)
     return output.getvalue()
 
+
 @app.post("/fill")
 async def fill_template_endpoint(request: FillRequest):
     """Fill template and return as download."""
@@ -505,6 +520,7 @@ async def fill_template_endpoint(request: FillRequest):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f"attachment; filename={request.output_filename}"}
     )
+
 
 @app.post("/fill-and-upload")
 async def fill_and_upload_endpoint(request: FillAndUploadRequest):
@@ -527,6 +543,7 @@ async def fill_and_upload_endpoint(request: FillAndUploadRequest):
         "output_url": output_url,
         "original_key": request.output_key  # Also return what was requested
     }
+
 
 if __name__ == "__main__":
     import uvicorn
