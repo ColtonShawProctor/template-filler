@@ -44,9 +44,9 @@ IMAGE_WIDTHS = {
     "IMAGE_CAPITAL_STACK_CLOSING": 6.5,
     "IMAGE_LOAN_TO_COST": 6.0,
     "IMAGE_LTV_LTC": 6.0,
-    "IMAGE_AERIAL_MAP": 3.25,      # Was 5.0
-    "IMAGE_LOCATION_MAP": 3.25,    # Was 5.0
-    "IMAGE_REGIONAL_MAP": 3.25,    # Was 5.0
+    "IMAGE_AERIAL_MAP": 4.0,
+    "IMAGE_LOCATION_MAP": 4.0,
+    "IMAGE_REGIONAL_MAP": 4.0,
     "IMAGE_SITE_PLAN": 5.5,
     "IMAGE_PILOT_SCHEDULE": 6.0,
     "IMAGE_TAKEOUT_SIZING": 6.0,
@@ -403,7 +403,9 @@ def insert_sponsor_paragraphs(paragraph, content: str):
 def insert_risks_paragraphs(paragraph, content: str):
     """
     Replace a paragraph with multiple paragraphs for RISKS_SECTION.
-    Each risk gets its own paragraph with bold risk name, tab, then mitigant text.
+    Each risk gets:
+    - Bold risk name on its own line
+    - Mitigant text as a regular paragraph below
     """
     parsed = parse_risks_section(content)
     
@@ -425,23 +427,30 @@ def insert_risks_paragraphs(paragraph, content: str):
             continue
         
         if item.get("type") == "risk":
+            # PARAGRAPH 1: Bold risk name only
             if first_content:
-                # Use original paragraph
-                target_para = current_para
+                header_para = current_para
                 first_content = False
             else:
-                # Create new paragraph
-                target_para = create_paragraph_after(current_para)
-                current_para = target_para
+                header_para = create_paragraph_after(current_para)
+                current_para = header_para
             
-            # Set hanging indent for risk format (matches template: left=2160, hanging=2160)
-            pPr = target_para._p.get_or_add_pPr()
+            # No hanging indent - just regular paragraph with bold text
+            risk_run = header_para.add_run(item["risk_name"])
+            apply_font_formatting(risk_run, FONT_SIZE_11PT, bold=True)
+            set_paragraph_spacing(header_para, space_after=0, line_spacing=240)
+            
+            # PARAGRAPH 2: Mitigant text (indented)
+            mitigant_para = create_paragraph_after(header_para)
+            current_para = mitigant_para
+            
+            # Set left indent for mitigant (optional - remove if you want flush left)
+            pPr = mitigant_para._p.get_or_add_pPr()
             ind = pPr.find(qn('w:ind'))
             if ind is None:
                 ind = OxmlElement('w:ind')
                 pPr.append(ind)
-            ind.set(qn('w:left'), '2160')      # 1.5 inches in twips
-            ind.set(qn('w:hanging'), '2160')   # Hanging indent
+            ind.set(qn('w:left'), '720')  # 0.5 inch indent
             
             # Set justified alignment
             jc = pPr.find(qn('w:jc'))
@@ -450,18 +459,9 @@ def insert_risks_paragraphs(paragraph, content: str):
                 pPr.append(jc)
             jc.set(qn('w:val'), 'both')
             
-            # Add bold risk name
-            risk_run = target_para.add_run(item["risk_name"])
-            apply_font_formatting(risk_run, FONT_SIZE_11PT, bold=True)
-            
-            # Add tab
-            tab_run = target_para.add_run("\t")
-            
-            # Add mitigant text (not bold)
-            mitigant_run = target_para.add_run(item["mitigant"])
+            mitigant_run = mitigant_para.add_run(item["mitigant"])
             apply_font_formatting(mitigant_run, FONT_SIZE_11PT, bold=False)
-            
-            set_paragraph_spacing(target_para, space_after=0, line_spacing=240)
+            set_paragraph_spacing(mitigant_para, space_after=0, line_spacing=240)
         
         elif item.get("type") == "text":
             # Plain text paragraph
