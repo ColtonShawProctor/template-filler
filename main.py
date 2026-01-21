@@ -44,12 +44,13 @@ IMAGE_WIDTHS = {
     "IMAGE_CAPITAL_STACK_CLOSING": 6.5,
     "IMAGE_LOAN_TO_COST": 6.0,
     "IMAGE_LTV_LTC": 6.0,
-    "IMAGE_AERIAL_MAP": 5.0,
-    "IMAGE_LOCATION_MAP": 5.0,
-    "IMAGE_REGIONAL_MAP": 5.0,
+    "IMAGE_AERIAL_MAP": 3.25,      # Was 5.0
+    "IMAGE_LOCATION_MAP": 3.25,    # Was 5.0
+    "IMAGE_REGIONAL_MAP": 3.25,    # Was 5.0
     "IMAGE_SITE_PLAN": 5.5,
     "IMAGE_PILOT_SCHEDULE": 6.0,
     "IMAGE_TAKEOUT_SIZING": 6.0,
+    "IMAGE_STREET_VIEW": 5.5,      # Add this line
 }
 
 # Font formatting constants
