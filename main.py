@@ -2,8 +2,9 @@ import os
 import re
 import base64
 from io import BytesIO
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from datetime import datetime
+from copy import deepcopy
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -11,10 +12,12 @@ from pydantic import BaseModel
 import boto3
 from botocore.config import Config
 from docx import Document
-from docx.shared import Inches, Pt
+from docx.shared import Inches, Pt, Twips
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 from PIL import Image
 
-app = FastAPI(title="IDS Template Filler", version="1.0.0")
+app = FastAPI(title="IDS Template Filler", version="1.1.0")
 
 # S3 Configuration
 S3_ENDPOINT = "https://nyc3.digitaloceanspaces.com"
@@ -112,7 +115,7 @@ class FillAndUploadRequest(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "1.1.0"}
 
 
 def download_template(template_key: str) -> bytes:
@@ -207,85 +210,270 @@ def apply_default_font_formatting(run):
     run.font.size = FONT_SIZE_11PT
 
 
-def format_sponsor_section_content(content: str, paragraph):
+def create_paragraph_after(paragraph, doc=None):
     """
-    Format SPONSOR_SECTION content with special rules:
-    - If first line starts with "Sponsorship", make it 11pt Bold
-    - Company/sponsor name lines (short, followed by longer text): 11pt Bold  
-    - Bio/description paragraphs: 11pt Regular
+    Create a new paragraph element after the given paragraph.
+    Returns the new paragraph object.
+    """
+    new_p = OxmlElement('w:p')
+    paragraph._p.addnext(new_p)
     
-    If content doesn't follow the expected structure, just apply regular formatting.
+    # We need to wrap this in a Paragraph object
+    # Find it in the document
+    from docx.text.paragraph import Paragraph
+    new_para = Paragraph(new_p, paragraph._parent)
+    return new_para
+
+
+def set_paragraph_spacing(paragraph, space_after=0, line_spacing=240):
+    """Set paragraph spacing (space_after in Pt, line_spacing in twips - 240 = single)."""
+    pPr = paragraph._p.get_or_add_pPr()
+    spacing = pPr.find(qn('w:spacing'))
+    if spacing is None:
+        spacing = OxmlElement('w:spacing')
+        pPr.append(spacing)
+    spacing.set(qn('w:after'), str(int(space_after * 20)))  # Convert Pt to twips
+    spacing.set(qn('w:line'), str(line_spacing))
+    spacing.set(qn('w:lineRule'), 'auto')
+
+
+def parse_sponsor_section(content: str) -> List[dict]:
+    """
+    Parse SPONSOR_SECTION content into structured list of paragraphs.
+    
+    Expected input format:
+    Sponsorship – B+
+    
+    Company Name
+    Company description paragraph...
+    
+    Person Name – Title
+    Person bio paragraph...
+    
+    Returns list of dicts: [{"text": "...", "bold": True/False, "is_blank": True/False}]
     """
     if not content:
-        return
+        return []
     
-    # Sanitize whitespace first
     content = sanitize_text_content(content)
-    
-    # Split into lines
     lines = content.split('\n')
+    paragraphs = []
     
-    # Clear existing runs
-    paragraph.clear()
-    
-    if not lines:
-        return
-    
-    # Check if first line looks like "Sponsorship – [Grade]"
-    first_line = lines[0].strip()
-    first_line_is_sponsorship = first_line.lower().startswith("sponsorship")
-    
-    # Process first line
-    first_run = paragraph.add_run(first_line)
-    apply_font_formatting(first_run, FONT_SIZE_11PT, bold=first_line_is_sponsorship)
-    
-    # Process remaining lines
-    i = 1
+    i = 0
     while i < len(lines):
         line = lines[i].strip()
         
+        # Empty line = blank paragraph for spacing
         if not line:
-            # Empty line - add line break for paragraph separation
-            if i < len(lines) - 1:  # Don't add break after last line
-                paragraph.add_run().add_break()
+            paragraphs.append({"text": "", "bold": False, "is_blank": True})
             i += 1
             continue
         
-        # Heuristic to detect company/sponsor name headers:
-        # Must meet ALL of these criteria:
-        # 1. Line is short (< 60 chars)
-        # 2. Does NOT end with sentence-ending punctuation
-        # 3. Contains at least one capital letter
-        # 4. Next non-empty line exists and is significantly longer (at least 2x)
+        # Determine if this line should be bold (header)
         is_header = False
         
-        line_length = len(line)
-        ends_with_punctuation = line.endswith('.') or line.endswith('!') or line.endswith('?') or line.endswith(':')
-        has_capitals = any(c.isupper() for c in line)
+        # Grade line: "Sponsorship – X" or "Sponsorship - X"
+        if line.lower().startswith("sponsorship"):
+            is_header = True
+        # Person line: Contains " – " (em-dash) with title
+        elif " – " in line:
+            is_header = True
+        # Person line: Contains " - " (hyphen) with title pattern like "Name - Title"
+        elif " - " in line and len(line) < 80:
+            # Check if it looks like "Name - Title" pattern
+            parts = line.split(" - ", 1)
+            if len(parts) == 2 and len(parts[0]) < 40 and len(parts[1]) < 40:
+                is_header = True
+        # Company name: Short line followed by longer description
+        elif len(line) < 60 and not line.endswith('.'):
+            # Look ahead for description
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                # If next line is long text (description), this is a header
+                if next_line and len(next_line) > 80:
+                    is_header = True
         
-        if line_length < 60 and not ends_with_punctuation and has_capitals:
-            # Look ahead to next non-empty line
-            for j in range(i + 1, len(lines)):
-                next_line = lines[j].strip()
-                if next_line:
-                    # Only mark as header if next line is substantially longer
-                    if len(next_line) >= line_length * 2:
-                        is_header = True
-                    break
-        
-        # Add line break before this line (since we're not the first line)
-        paragraph.add_run().add_break()
-        
-        # Add the line with appropriate formatting
-        run = paragraph.add_run(line)
-        apply_font_formatting(run, FONT_SIZE_11PT, bold=is_header)
-        
+        paragraphs.append({"text": line, "bold": is_header, "is_blank": False})
         i += 1
     
-    # Set paragraph spacing
-    ppr = paragraph.paragraph_format
-    ppr.line_spacing_rule = 1  # Single spacing
-    ppr.space_after = Pt(0)  # No extra space after
+    return paragraphs
+
+
+def parse_risks_section(content: str) -> List[dict]:
+    """
+    Parse RISKS_SECTION content into structured list.
+    
+    Expected input format (tab-separated):
+    Risk Name\tMitigant text paragraph...
+    
+    Risk Name 2\tMitigant text paragraph...
+    
+    Returns list of dicts with risk info and blank line indicators.
+    """
+    if not content:
+        return []
+    
+    content = sanitize_text_content(content)
+    
+    # Split by double newline to get individual risks
+    risk_blocks = re.split(r'\n\n+', content)
+    
+    paragraphs = []
+    
+    for idx, block in enumerate(risk_blocks):
+        block = block.strip()
+        if not block:
+            continue
+        
+        # Check for tab separator
+        if '\t' in block:
+            parts = block.split('\t', 1)
+            risk_name = parts[0].strip()
+            mitigant = parts[1].strip() if len(parts) > 1 else ""
+            paragraphs.append({
+                "type": "risk",
+                "risk_name": risk_name,
+                "mitigant": mitigant
+            })
+        else:
+            # No tab - might be legacy format or malformed
+            # Try to detect "Risk Name    Description" pattern (multiple spaces)
+            space_match = re.match(r'^([A-Z][^.]{5,40}?)\s{2,}(.+)$', block, re.DOTALL)
+            if space_match:
+                paragraphs.append({
+                    "type": "risk",
+                    "risk_name": space_match.group(1).strip(),
+                    "mitigant": space_match.group(2).strip()
+                })
+            else:
+                # Just treat as plain text
+                paragraphs.append({
+                    "type": "text",
+                    "text": block
+                })
+        
+        # Add blank line between risks (except after last)
+        if idx < len(risk_blocks) - 1:
+            paragraphs.append({"type": "blank"})
+    
+    return paragraphs
+
+
+def insert_sponsor_paragraphs(paragraph, content: str):
+    """
+    Replace a paragraph with multiple paragraphs for SPONSOR_SECTION.
+    The original paragraph is used for the first content, then new paragraphs are inserted after.
+    """
+    parsed = parse_sponsor_section(content)
+    
+    if not parsed:
+        return
+    
+    # Clear the original paragraph
+    paragraph.clear()
+    
+    # Use the original paragraph for the first non-blank item
+    current_para = paragraph
+    first_content = True
+    
+    for item in parsed:
+        if first_content and not item.get("is_blank", False):
+            # Use original paragraph for first content
+            if item.get("text"):
+                run = current_para.add_run(item["text"])
+                apply_font_formatting(run, FONT_SIZE_11PT, bold=item.get("bold", False))
+            set_paragraph_spacing(current_para, space_after=0, line_spacing=240)
+            first_content = False
+        else:
+            # Create new paragraph after current
+            new_para = create_paragraph_after(current_para)
+            
+            if item.get("is_blank", False):
+                # Empty paragraph for spacing
+                set_paragraph_spacing(new_para, space_after=0, line_spacing=240)
+            else:
+                run = new_para.add_run(item.get("text", ""))
+                apply_font_formatting(run, FONT_SIZE_11PT, bold=item.get("bold", False))
+                set_paragraph_spacing(new_para, space_after=0, line_spacing=240)
+            
+            current_para = new_para
+
+
+def insert_risks_paragraphs(paragraph, content: str):
+    """
+    Replace a paragraph with multiple paragraphs for RISKS_SECTION.
+    Each risk gets its own paragraph with bold risk name, tab, then mitigant text.
+    """
+    parsed = parse_risks_section(content)
+    
+    if not parsed:
+        return
+    
+    # Clear the original paragraph
+    paragraph.clear()
+    
+    current_para = paragraph
+    first_content = True
+    
+    for item in parsed:
+        if item.get("type") == "blank":
+            # Create blank paragraph for spacing
+            new_para = create_paragraph_after(current_para)
+            set_paragraph_spacing(new_para, space_after=0, line_spacing=240)
+            current_para = new_para
+            continue
+        
+        if item.get("type") == "risk":
+            if first_content:
+                # Use original paragraph
+                target_para = current_para
+                first_content = False
+            else:
+                # Create new paragraph
+                target_para = create_paragraph_after(current_para)
+                current_para = target_para
+            
+            # Set hanging indent for risk format (matches template: left=2160, hanging=2160)
+            pPr = target_para._p.get_or_add_pPr()
+            ind = pPr.find(qn('w:ind'))
+            if ind is None:
+                ind = OxmlElement('w:ind')
+                pPr.append(ind)
+            ind.set(qn('w:left'), '2160')      # 1.5 inches in twips
+            ind.set(qn('w:hanging'), '2160')   # Hanging indent
+            
+            # Set justified alignment
+            jc = pPr.find(qn('w:jc'))
+            if jc is None:
+                jc = OxmlElement('w:jc')
+                pPr.append(jc)
+            jc.set(qn('w:val'), 'both')
+            
+            # Add bold risk name
+            risk_run = target_para.add_run(item["risk_name"])
+            apply_font_formatting(risk_run, FONT_SIZE_11PT, bold=True)
+            
+            # Add tab
+            tab_run = target_para.add_run("\t")
+            
+            # Add mitigant text (not bold)
+            mitigant_run = target_para.add_run(item["mitigant"])
+            apply_font_formatting(mitigant_run, FONT_SIZE_11PT, bold=False)
+            
+            set_paragraph_spacing(target_para, space_after=0, line_spacing=240)
+        
+        elif item.get("type") == "text":
+            # Plain text paragraph
+            if first_content:
+                target_para = current_para
+                first_content = False
+            else:
+                target_para = create_paragraph_after(current_para)
+                current_para = target_para
+            
+            run = target_para.add_run(item.get("text", ""))
+            apply_font_formatting(run, FONT_SIZE_11PT, bold=False)
+            set_paragraph_spacing(target_para, space_after=0, line_spacing=240)
 
 
 def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -> bool:
@@ -320,10 +508,15 @@ def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -
         if placeholder_key in placeholders:
             replacement = str(placeholders[placeholder_key])
             
-            # Special handling for SPONSOR_SECTION
+            # Special handling for SPONSOR_SECTION - insert multiple paragraphs
             if placeholder_key == "SPONSOR_SECTION":
-                # Sanitize and format the entire paragraph with special rules
-                format_sponsor_section_content(replacement, paragraph)
+                insert_sponsor_paragraphs(paragraph, replacement)
+                modified = True
+                continue
+            
+            # Special handling for RISKS_SECTION - insert multiple paragraphs with formatting
+            if placeholder_key == "RISKS_SECTION":
+                insert_risks_paragraphs(paragraph, replacement)
                 modified = True
                 continue
             
@@ -454,7 +647,9 @@ def replace_image_placeholders_in_paragraph(paragraph, images: Dict[str, str]) -
 
 def process_paragraphs(paragraphs, placeholders: Dict[str, str], images: Dict[str, str]):
     """Process paragraphs for text and image replacements."""
-    for paragraph in paragraphs:
+    # Convert to list to avoid issues with modifying during iteration
+    para_list = list(paragraphs)
+    for paragraph in para_list:
         # Try text replacement first
         replace_placeholders_in_paragraph(paragraph, placeholders)
         # Then try image replacement
