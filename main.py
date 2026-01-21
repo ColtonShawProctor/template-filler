@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import boto3
 from botocore.config import Config
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt
 from PIL import Image
 
 app = FastAPI(title="IDS Template Filler", version="1.0.0")
@@ -48,6 +48,10 @@ IMAGE_WIDTHS = {
     "IMAGE_PILOT_SCHEDULE": 6.0,
     "IMAGE_TAKEOUT_SIZING": 6.0,
 }
+
+# Font formatting constants
+FONT_NAME = "Times New Roman"
+FONT_SIZE_11PT = Pt(11)  # Default for all body text placeholders
 
 def calculate_image_dimensions(image_bytes: bytes, preferred_width: float) -> Tuple[float, float]:
     """
@@ -160,10 +164,117 @@ def upload_to_s3(content: bytes, key: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload to S3: {str(e)}")
 
+def sanitize_text_content(text: str) -> str:
+    """
+    Clean up LLM-generated text content.
+    - Replace 3+ newlines with 2 (single paragraph break)
+    - Strip leading/trailing whitespace
+    """
+    if not text:
+        return text
+    # Replace 3+ newlines with 2 (single paragraph break)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Strip leading/trailing whitespace
+    text = text.strip()
+    return text
+
+def apply_font_formatting(run, font_size: Pt, bold: bool = False):
+    """Apply font formatting to a run (used for SPONSOR_SECTION special formatting)."""
+    run.font.name = FONT_NAME
+    run.font.size = font_size
+    run.font.bold = bold
+
+def apply_default_font_formatting(run):
+    """Apply default 11pt Times New Roman formatting to a run."""
+    run.font.name = FONT_NAME
+    run.font.size = FONT_SIZE_11PT
+
+def format_sponsor_section_content(content: str, paragraph):
+    """
+    Format SPONSOR_SECTION content with special rules:
+    - First line (Sponsorship – [Grade]): 11pt Bold
+    - Company/sponsor name lines: 11pt Bold
+    - Bio/description paragraphs: 11pt Regular
+    """
+    if not content:
+        return
+    
+    # Sanitize whitespace first
+    content = sanitize_text_content(content)
+    
+    # Split into lines
+    lines = content.split('\n')
+    
+    # Clear existing runs
+    paragraph.clear()
+    
+    if not lines:
+        return
+    
+    # Process first line (should be "Sponsorship – [Grade]")
+    first_run = paragraph.add_run(lines[0])
+    apply_font_formatting(first_run, FONT_SIZE_11PT, bold=True)
+    
+    # Process remaining lines
+    i = 1
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        if not line:
+            # Empty line - add line break for paragraph separation
+            if i < len(lines) - 1:  # Don't add break after last line
+                paragraph.add_run().add_break()
+            i += 1
+            continue
+        
+        # Heuristic to detect company/sponsor name headers:
+        # - Line is relatively short (< 80 chars)
+        # - Next non-empty line is significantly longer (at least 1.5x)
+        # - OR line looks like a name (contains common name patterns)
+        is_header = False
+        
+        # Check if it looks like a name/company (contains capital letters, no sentence-ending punctuation)
+        looks_like_name = (
+            len(line) < 80 and
+            not line.endswith('.') and
+            not line.endswith('!') and
+            not line.endswith('?') and
+            any(c.isupper() for c in line)
+        )
+        
+        if looks_like_name:
+            # Look ahead to next non-empty line to confirm
+            for j in range(i + 1, len(lines)):
+                next_line = lines[j].strip()
+                if next_line:
+                    # If next line is much longer, this is likely a header
+                    if len(next_line) > len(line) * 1.5:
+                        is_header = True
+                    # If next line starts with lowercase or is a sentence, this is a header
+                    elif next_line and next_line[0].islower():
+                        is_header = True
+                    break
+        
+        # Add the line
+        run = paragraph.add_run(line)
+        apply_font_formatting(run, FONT_SIZE_11PT, bold=is_header)
+        
+        # Add line break if not last line
+        if i < len(lines) - 1:
+            paragraph.add_run().add_break()
+        
+        i += 1
+    
+    # Set paragraph spacing
+    ppr = paragraph.paragraph_format
+    ppr.line_spacing_rule = 1  # Single spacing
+    ppr.space_after = Pt(0)  # No extra space after
+
 def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -> bool:
     """
     Replace {{PLACEHOLDER}} patterns across run boundaries.
     Handles Word's tendency to split text across multiple runs.
+    Applies proper formatting based on placeholder type.
     """
     # Build full text and map character positions to runs
     full_text = ""
@@ -181,12 +292,26 @@ def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -
     modified = False
     pattern = re.compile(r'\{\{([A-Z0-9_]+)\}\}')
     
+    # Track replacements to apply formatting after
+    replacements_to_format = []
+    
     # Process replacements from end to start (so positions stay valid)
     matches = list(pattern.finditer(full_text))
     for match in reversed(matches):
         placeholder_key = match.group(1)
         if placeholder_key in placeholders:
             replacement = str(placeholders[placeholder_key])
+            
+            # Special handling for SPONSOR_SECTION
+            if placeholder_key == "SPONSOR_SECTION":
+                # Sanitize and format the entire paragraph with special rules
+                format_sponsor_section_content(replacement, paragraph)
+                modified = True
+                continue
+            
+            # Sanitize text content for other placeholders
+            replacement = sanitize_text_content(replacement)
+            
             start_pos = match.start()
             end_pos = match.end()
             
@@ -199,6 +324,8 @@ def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -
                     # Placeholder is within a single run - simple case
                     run = paragraph.runs[start_run_idx]
                     run.text = run.text[:start_char_idx] + replacement + run.text[end_char_idx + 1:]
+                    # Store for formatting
+                    replacements_to_format.append((start_run_idx, placeholder_key, replacement))
                 else:
                     # Placeholder spans multiple runs
                     # Put replacement in first run, clear the rest
@@ -214,6 +341,9 @@ def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -
                     # Clear runs in between
                     for run_idx in range(start_run_idx + 1, end_run_idx):
                         paragraph.runs[run_idx].text = ""
+                    
+                    # Store for formatting
+                    replacements_to_format.append((start_run_idx, placeholder_key, replacement))
                 
                 modified = True
                 
@@ -224,6 +354,22 @@ def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -
                     for char_idx, char in enumerate(run.text):
                         char_to_run.append((run_idx, char_idx))
                     full_text += run.text
+    
+    # Apply formatting to replaced text
+    if modified and replacements_to_format:
+        # Apply default 11pt Times New Roman formatting to all runs with replacements
+        for run_idx, placeholder_key, replacement_text in replacements_to_format:
+            if run_idx < len(paragraph.runs):
+                run = paragraph.runs[run_idx]
+                apply_default_font_formatting(run)
+    
+    # Set paragraph spacing properties for consistent formatting
+    if modified:
+        ppr = paragraph.paragraph_format
+        # Set line spacing: single spacing (lineRule="auto")
+        # This ensures consistent paragraph spacing
+        ppr.line_spacing_rule = 1  # Single spacing
+        ppr.space_after = Pt(0)  # No extra space after
     
     return modified
 
@@ -294,94 +440,94 @@ def replace_image_placeholders_in_paragraph(paragraph, images: Dict[str, str]) -
     
     return False
 
-def process_paragraphs(paragraphs, placeholders: Dict[str, str], images: Dict[str, str]):
-    """Process paragraphs for text and image replacements."""
-    for paragraph in paragraphs:
-        # Try text replacement first
-        replace_placeholders_in_paragraph(paragraph, placeholders)
-        # Then try image replacement
-        replace_image_placeholders_in_paragraph(paragraph, images)
+    def process_paragraphs(paragraphs, placeholders: Dict[str, str], images: Dict[str, str]):
+        """Process paragraphs for text and image replacements."""
+        for paragraph in paragraphs:
+            # Try text replacement first
+            replace_placeholders_in_paragraph(paragraph, placeholders)
+            # Then try image replacement
+            replace_image_placeholders_in_paragraph(paragraph, images)
 
-def replace_placeholders_in_table(table, placeholders: Dict[str, str], images: Dict[str, str]) -> bool:
-    """Replace placeholders in all cells of a table."""
-    modified = False
-    for row in table.rows:
-        for cell in row.cells:
-            process_paragraphs(cell.paragraphs, placeholders, images)
-            modified = True
-    return modified
+    def replace_placeholders_in_table(table, placeholders: Dict[str, str], images: Dict[str, str]) -> bool:
+        """Replace placeholders in all cells of a table."""
+        modified = False
+        for row in table.rows:
+            for cell in row.cells:
+                process_paragraphs(cell.paragraphs, placeholders, images)
+                modified = True
+        return modified
 
-def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: Dict[str, str]) -> bytes:
-    """Fill the template with placeholders and images."""
-    doc = Document(BytesIO(template_bytes))
-    
-    # Process main document paragraphs
-    process_paragraphs(doc.paragraphs, placeholders, images)
-    
-    # Process tables
-    for table in doc.tables:
-        replace_placeholders_in_table(table, placeholders, images)
-    
-    # Process headers and footers for all section types
-    for section in doc.sections:
-        # Process different header types
-        for header in [section.header, section.first_page_header, section.even_page_header]:
-            if header:
-                process_paragraphs(header.paragraphs, placeholders, images)
-                for table in header.tables:
-                    replace_placeholders_in_table(table, placeholders, images)
+    def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: Dict[str, str]) -> bytes:
+        """Fill the template with placeholders and images."""
+        doc = Document(BytesIO(template_bytes))
         
-        # Process different footer types
-        for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
-            if footer:
-                process_paragraphs(footer.paragraphs, placeholders, images)
-                for table in footer.tables:
-                    replace_placeholders_in_table(table, placeholders, images)
-    
-    # Save to bytes
-    output = BytesIO()
-    doc.save(output)
-    output.seek(0)
-    return output.getvalue()
+        # Process main document paragraphs
+        process_paragraphs(doc.paragraphs, placeholders, images)
+        
+        # Process tables
+        for table in doc.tables:
+            replace_placeholders_in_table(table, placeholders, images)
+        
+        # Process headers and footers for all section types
+        for section in doc.sections:
+            # Process different header types
+            for header in [section.header, section.first_page_header, section.even_page_header]:
+                if header:
+                    process_paragraphs(header.paragraphs, placeholders, images)
+                    for table in header.tables:
+                        replace_placeholders_in_table(table, placeholders, images)
+            
+            # Process different footer types
+            for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
+                if footer:
+                    process_paragraphs(footer.paragraphs, placeholders, images)
+                    for table in footer.tables:
+                        replace_placeholders_in_table(table, placeholders, images)
+        
+        # Save to bytes
+        output = BytesIO()
+        doc.save(output)
+        output.seek(0)
+        return output.getvalue()
 
-@app.post("/fill")
-async def fill_template_endpoint(request: FillRequest):
-    """Fill template and return as download."""
-    # Download template
-    template_bytes = download_template(request.template_key)
-    
-    # Fill template
-    filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
-    
-    # Return as download
-    return StreamingResponse(
-        BytesIO(filled_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f"attachment; filename={request.output_filename}"}
-    )
+    @app.post("/fill")
+    async def fill_template_endpoint(request: FillRequest):
+        """Fill template and return as download."""
+        # Download template
+        template_bytes = download_template(request.template_key)
+        
+        # Fill template
+        filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
+        
+        # Return as download
+        return StreamingResponse(
+            BytesIO(filled_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f"attachment; filename={request.output_filename}"}
+        )
 
-@app.post("/fill-and-upload")
-async def fill_and_upload_endpoint(request: FillAndUploadRequest):
-    """Fill template and upload to S3."""
-    # Download template
-    template_bytes = download_template(request.template_key)
-    
-    # Fill template
-    filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
-    
-    # Get unique filename if original exists
-    output_key = get_unique_output_key(s3_client, S3_BUCKET, request.output_key)
-    
-    # Upload to S3
-    output_url = upload_to_s3(filled_bytes, output_key)
-    
-    return {
-        "success": True,
-        "output_key": output_key,  # Return actual filename used
-        "output_url": output_url,
-        "original_key": request.output_key  # Also return what was requested
-    }
+    @app.post("/fill-and-upload")
+    async def fill_and_upload_endpoint(request: FillAndUploadRequest):
+        """Fill template and upload to S3."""
+        # Download template
+        template_bytes = download_template(request.template_key)
+        
+        # Fill template
+        filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
+        
+        # Get unique filename if original exists
+        output_key = get_unique_output_key(s3_client, S3_BUCKET, request.output_key)
+        
+        # Upload to S3
+        output_url = upload_to_s3(filled_bytes, output_key)
+        
+        return {
+            "success": True,
+            "output_key": output_key,  # Return actual filename used
+            "output_url": output_url,
+            "original_key": request.output_key  # Also return what was requested
+        }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if __name__ == "__main__":
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000)
