@@ -440,94 +440,94 @@ def replace_image_placeholders_in_paragraph(paragraph, images: Dict[str, str]) -
     
     return False
 
-    def process_paragraphs(paragraphs, placeholders: Dict[str, str], images: Dict[str, str]):
-        """Process paragraphs for text and image replacements."""
-        for paragraph in paragraphs:
-            # Try text replacement first
-            replace_placeholders_in_paragraph(paragraph, placeholders)
-            # Then try image replacement
-            replace_image_placeholders_in_paragraph(paragraph, images)
+def process_paragraphs(paragraphs, placeholders: Dict[str, str], images: Dict[str, str]):
+    """Process paragraphs for text and image replacements."""
+    for paragraph in paragraphs:
+        # Try text replacement first
+        replace_placeholders_in_paragraph(paragraph, placeholders)
+        # Then try image replacement
+        replace_image_placeholders_in_paragraph(paragraph, images)
 
-    def replace_placeholders_in_table(table, placeholders: Dict[str, str], images: Dict[str, str]) -> bool:
-        """Replace placeholders in all cells of a table."""
-        modified = False
-        for row in table.rows:
-            for cell in row.cells:
-                process_paragraphs(cell.paragraphs, placeholders, images)
-                modified = True
-        return modified
+def replace_placeholders_in_table(table, placeholders: Dict[str, str], images: Dict[str, str]) -> bool:
+    """Replace placeholders in all cells of a table."""
+    modified = False
+    for row in table.rows:
+        for cell in row.cells:
+            process_paragraphs(cell.paragraphs, placeholders, images)
+            modified = True
+    return modified
 
-    def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: Dict[str, str]) -> bytes:
-        """Fill the template with placeholders and images."""
-        doc = Document(BytesIO(template_bytes))
+def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: Dict[str, str]) -> bytes:
+    """Fill the template with placeholders and images."""
+    doc = Document(BytesIO(template_bytes))
+    
+    # Process main document paragraphs
+    process_paragraphs(doc.paragraphs, placeholders, images)
+    
+    # Process tables
+    for table in doc.tables:
+        replace_placeholders_in_table(table, placeholders, images)
+    
+    # Process headers and footers for all section types
+    for section in doc.sections:
+        # Process different header types
+        for header in [section.header, section.first_page_header, section.even_page_header]:
+            if header:
+                process_paragraphs(header.paragraphs, placeholders, images)
+                for table in header.tables:
+                    replace_placeholders_in_table(table, placeholders, images)
         
-        # Process main document paragraphs
-        process_paragraphs(doc.paragraphs, placeholders, images)
-        
-        # Process tables
-        for table in doc.tables:
-            replace_placeholders_in_table(table, placeholders, images)
-        
-        # Process headers and footers for all section types
-        for section in doc.sections:
-            # Process different header types
-            for header in [section.header, section.first_page_header, section.even_page_header]:
-                if header:
-                    process_paragraphs(header.paragraphs, placeholders, images)
-                    for table in header.tables:
-                        replace_placeholders_in_table(table, placeholders, images)
-            
-            # Process different footer types
-            for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
-                if footer:
-                    process_paragraphs(footer.paragraphs, placeholders, images)
-                    for table in footer.tables:
-                        replace_placeholders_in_table(table, placeholders, images)
-        
-        # Save to bytes
-        output = BytesIO()
-        doc.save(output)
-        output.seek(0)
-        return output.getvalue()
+        # Process different footer types
+        for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
+            if footer:
+                process_paragraphs(footer.paragraphs, placeholders, images)
+                for table in footer.tables:
+                    replace_placeholders_in_table(table, placeholders, images)
+    
+    # Save to bytes
+    output = BytesIO()
+    doc.save(output)
+    output.seek(0)
+    return output.getvalue()
 
-    @app.post("/fill")
-    async def fill_template_endpoint(request: FillRequest):
-        """Fill template and return as download."""
-        # Download template
-        template_bytes = download_template(request.template_key)
-        
-        # Fill template
-        filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
-        
-        # Return as download
-        return StreamingResponse(
-            BytesIO(filled_bytes),
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f"attachment; filename={request.output_filename}"}
-        )
+@app.post("/fill")
+async def fill_template_endpoint(request: FillRequest):
+    """Fill template and return as download."""
+    # Download template
+    template_bytes = download_template(request.template_key)
+    
+    # Fill template
+    filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
+    
+    # Return as download
+    return StreamingResponse(
+        BytesIO(filled_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename={request.output_filename}"}
+    )
 
-    @app.post("/fill-and-upload")
-    async def fill_and_upload_endpoint(request: FillAndUploadRequest):
-        """Fill template and upload to S3."""
-        # Download template
-        template_bytes = download_template(request.template_key)
-        
-        # Fill template
-        filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
-        
-        # Get unique filename if original exists
-        output_key = get_unique_output_key(s3_client, S3_BUCKET, request.output_key)
-        
-        # Upload to S3
-        output_url = upload_to_s3(filled_bytes, output_key)
-        
-        return {
-            "success": True,
-            "output_key": output_key,  # Return actual filename used
-            "output_url": output_url,
-            "original_key": request.output_key  # Also return what was requested
-        }
+@app.post("/fill-and-upload")
+async def fill_and_upload_endpoint(request: FillAndUploadRequest):
+    """Fill template and upload to S3."""
+    # Download template
+    template_bytes = download_template(request.template_key)
+    
+    # Fill template
+    filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
+    
+    # Get unique filename if original exists
+    output_key = get_unique_output_key(s3_client, S3_BUCKET, request.output_key)
+    
+    # Upload to S3
+    output_url = upload_to_s3(filled_bytes, output_key)
+    
+    return {
+        "success": True,
+        "output_key": output_key,  # Return actual filename used
+        "output_url": output_url,
+        "original_key": request.output_key  # Also return what was requested
+    }
 
-    if __name__ == "__main__":
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
