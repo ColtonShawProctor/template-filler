@@ -243,7 +243,11 @@ def fill_term_sheet(template_bytes: bytes, placeholders: Dict[str, str]) -> byte
                     for key, value in placeholders.items():
                         token = "{{" + key + "}}"
                         if token in xml_text:
-                            xml_text = xml_text.replace(token, xml_escape(value))
+                            escaped = xml_escape(value)
+                            # Prepend space after colon for [MISSING sentinels
+                            if value.startswith("[MISSING"):
+                                xml_text = xml_text.replace(':' + token, ':' + ' ' + escaped)
+                            xml_text = xml_text.replace(token, escaped)
                     data = xml_text.encode("utf-8")
 
                 zout.writestr(item, data)
@@ -627,8 +631,12 @@ def replace_placeholders_in_paragraph(paragraph, placeholders: Dict[str, str]) -
             
             # Sanitize text content for other placeholders
             replacement = sanitize_text_content(replacement)
-            
+
             start_pos = match.start()
+
+            # Prepend space after colon for [MISSING sentinels
+            if replacement.startswith("[MISSING") and start_pos > 0 and full_text[start_pos - 1] == ':':
+                replacement = ' ' + replacement
             end_pos = match.end()
             
             # Find which runs are affected
