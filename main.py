@@ -865,9 +865,10 @@ def normalize_fonts_to_arial(doc_bytes: bytes) -> bytes:
 def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING") -> bytes:
     """
     Post-processing: add yellow highlight to any <w:r> run whose <w:t>
-    text starts with *sentinel* (default "[MISSING").
+    text contains *sentinel* (default "[MISSING").
 
     Runs that already carry a <w:highlight> element are left alone.
+    Neighbouring runs are never touched.
     """
     escaped_sentinel = xml_escape(sentinel)
     input_buf = BytesIO(doc_bytes)
@@ -875,27 +876,50 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
 
     HIGHLIGHT_EL = '<w:highlight w:val="yellow"/>'
 
-    # Match a complete <w:r>…</w:r> block (non-greedy, DOTALL)
-    RUN_RE = re.compile(r'<w:r\b[^>]*>(?:(?!</w:r>).)*?</w:r>', re.DOTALL)
+    # Matches <w:r> or <w:r  (with attrs) but NOT <w:rPr>, <w:rFonts>, etc.
+    RUN_OPEN_RE = re.compile(r'<w:r[\s>]')
+    T_CONTENT_RE = re.compile(r'<w:t[^>]*>([^<]*)</w:t>')
+    RPR_OPEN_RE = re.compile(r'<w:rPr\b[^>]*>')
 
-    def _maybe_highlight(match):
-        run_xml = match.group(0)
+    def _process_xml(xml_text):
+        # Split on </w:r> so each chunk[i] + '</w:r>' is one run's content.
+        # This structurally isolates runs — no regex can overreach.
+        chunks = xml_text.split('</w:r>')
 
-        # Only runs whose <w:t> text contains the sentinel
-        t_texts = re.findall(r'<w:t[^>]*>([^<]*)</w:t>', run_xml)
-        combined = "".join(t_texts)
-        if escaped_sentinel not in combined:
-            return run_xml
+        for i in range(len(chunks) - 1):  # last chunk has no closing </w:r>
+            chunk = chunks[i]
 
-        # Already highlighted — leave alone
-        if 'w:highlight' in run_xml:
-            return run_xml
+            # Locate the last <w:r ...> opening tag in this chunk
+            opens = list(RUN_OPEN_RE.finditer(chunk))
+            if not opens:
+                continue
+            run_start = opens[-1].start()
+            run_body = chunk[run_start:]
 
-        # Inject highlight into existing <w:rPr>, or create one
-        if '<w:rPr>' in run_xml:
-            return run_xml.replace('<w:rPr>', f'<w:rPr>{HIGHLIGHT_EL}', 1)
-        else:
-            return run_xml.replace('<w:r>', f'<w:r><w:rPr>{HIGHLIGHT_EL}</w:rPr>', 1)
+            # Only act when <w:t> text contains the sentinel
+            if not any(escaped_sentinel in t
+                       for t in T_CONTENT_RE.findall(run_body)):
+                continue
+
+            # Already highlighted — skip
+            if 'w:highlight' in run_body:
+                continue
+
+            # Inject <w:highlight> into the run's <w:rPr>
+            rpr_m = RPR_OPEN_RE.search(run_body)
+            if rpr_m:
+                inject_at = run_start + rpr_m.end()
+                chunks[i] = (chunk[:inject_at]
+                             + HIGHLIGHT_EL
+                             + chunk[inject_at:])
+            else:
+                # No <w:rPr> — create one right after the <w:r...> opening tag
+                open_end = chunk.find('>', run_start) + 1
+                chunks[i] = (chunk[:open_end]
+                             + '<w:rPr>' + HIGHLIGHT_EL + '</w:rPr>'
+                             + chunk[open_end:])
+
+        return '</w:r>'.join(chunks)
 
     with zipfile.ZipFile(input_buf, "r") as zin:
         with zipfile.ZipFile(output_buf, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -904,7 +928,7 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
                 fname = item.filename.lower()
                 if fname.startswith("word/") and fname.endswith(".xml"):
                     xml_text = data.decode("utf-8")
-                    xml_text = RUN_RE.sub(_maybe_highlight, xml_text)
+                    xml_text = _process_xml(xml_text)
                     data = xml_text.encode("utf-8")
                 zout.writestr(item, data)
 
