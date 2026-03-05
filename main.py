@@ -1,6 +1,7 @@
 import os
 import re
 import base64
+import zipfile
 from io import BytesIO
 from typing import Dict, Optional, Tuple, List
 from datetime import datetime
@@ -17,7 +18,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from PIL import Image
 
-app = FastAPI(title="IDS Template Filler", version="1.1.0")
+app = FastAPI(title="Template Filler", version="1.2.0")
 
 # S3 Configuration
 S3_ENDPOINT = "https://nyc3.digitaloceanspaces.com"
@@ -116,7 +117,7 @@ class FillAndUploadRequest(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": "1.1.0"}
+    return {"status": "ok", "version": "1.2.0"}
 
 
 def download_template(template_key: str) -> bytes:
@@ -198,6 +199,75 @@ def sanitize_text_content(text: str) -> str:
     return text
 
 
+TERM_SHEET_TEMPLATE_MARKERS = ["Term_Sheet", "term_sheet"]
+
+
+def is_term_sheet_template(template_key: str) -> bool:
+    return any(marker in template_key for marker in TERM_SHEET_TEMPLATE_MARKERS)
+
+
+def xml_escape(text: str) -> str:
+    """Escape characters that are special in XML text content."""
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
+def fill_term_sheet(template_bytes: bytes, placeholders: Dict[str, str]) -> bytes:
+    """
+    Fill a Term Sheet template via direct XML string replacement.
+
+    Works at the raw XML level inside the .docx ZIP archive so that every
+    existing run property, style, header, footer, watermark, and embedded
+    image is preserved byte-for-byte (only the matched {{TOKEN}} text is
+    swapped out).
+    """
+    input_buf = BytesIO(template_bytes)
+    output_buf = BytesIO()
+
+    with zipfile.ZipFile(input_buf, "r") as zin:
+        with zipfile.ZipFile(output_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+
+                fname = item.filename.lower()
+                is_text_part = (
+                    fname == "word/document.xml"
+                    or fname.startswith("word/header")
+                    or fname.startswith("word/footer")
+                )
+
+                if is_text_part:
+                    xml_text = data.decode("utf-8")
+                    for key, value in placeholders.items():
+                        token = "{{" + key + "}}"
+                        if token in xml_text:
+                            xml_text = xml_text.replace(token, xml_escape(value))
+                    data = xml_text.encode("utf-8")
+
+                zout.writestr(item, data)
+
+    output_buf.seek(0)
+    doc_bytes = output_buf.getvalue()
+
+    # Normalize all fonts to Arial
+    doc_bytes = normalize_fonts_to_arial(doc_bytes)
+
+    return doc_bytes
+
+
+def validate_fill_result(doc_bytes: bytes) -> List[str]:
+    """Return any {{PLACEHOLDER}} tokens that still remain in the output."""
+    remaining: List[str] = []
+    with zipfile.ZipFile(BytesIO(doc_bytes), "r") as z:
+        for name in z.namelist():
+            if name.startswith("word/") and name.endswith(".xml"):
+                content = z.read(name).decode("utf-8", errors="replace")
+                remaining.extend(re.findall(r"\{\{([A-Z0-9_]+)\}\}", content))
+    return remaining
+
+
 def apply_font_formatting(run, font_size: Pt, bold: bool = False):
     """Apply font formatting to a run."""
     run.font.name = FONT_NAME
@@ -211,16 +281,47 @@ def apply_default_font_formatting(run):
     run.font.size = FONT_SIZE_11PT
 
 
+def clear_paragraph_content(paragraph):
+    """
+    Clear paragraph runs while preserving paragraph properties (pPr).
+
+    Unlike paragraph.clear() which removes ALL children (including pPr,
+    destroying style info), this only removes runs and other content,
+    keeping the <w:pPr> element intact so the paragraph retains its
+    style, justification, indentation, etc.
+    """
+    p = paragraph._p
+    pPr = p.find(qn('w:pPr'))
+    pPr_copy = deepcopy(pPr) if pPr is not None else None
+
+    # Remove all children
+    for child in list(p):
+        p.remove(child)
+
+    # Restore pPr
+    if pPr_copy is not None:
+        p.insert(0, pPr_copy)
+
+
 def create_paragraph_after(paragraph, doc=None):
     """
     Create a new paragraph element after the given paragraph.
-    Returns the new paragraph object.
+    Copies <w:pStyle> from the source paragraph so the new paragraph
+    inherits the same style (preventing bare <w:pStyle/> elements).
     """
     new_p = OxmlElement('w:p')
+
+    # Copy pStyle from source paragraph to maintain document style consistency
+    source_pPr = paragraph._p.find(qn('w:pPr'))
+    if source_pPr is not None:
+        source_pStyle = source_pPr.find(qn('w:pStyle'))
+        if source_pStyle is not None:
+            new_pPr = OxmlElement('w:pPr')
+            new_pPr.append(deepcopy(source_pStyle))
+            new_p.append(new_pPr)
+
     paragraph._p.addnext(new_p)
-    
-    # We need to wrap this in a Paragraph object
-    # Find it in the document
+
     from docx.text.paragraph import Paragraph
     new_para = Paragraph(new_p, paragraph._parent)
     return new_para
@@ -369,14 +470,14 @@ def insert_sponsor_paragraphs(paragraph, content: str):
     
     if not parsed:
         return
-    
-    # Clear the original paragraph
-    paragraph.clear()
-    
+
+    # Clear runs but preserve paragraph properties (style, justification, etc.)
+    clear_paragraph_content(paragraph)
+
     # Use the original paragraph for the first non-blank item
     current_para = paragraph
     first_content = True
-    
+
     for item in parsed:
         if first_content and not item.get("is_blank", False):
             # Use original paragraph for first content
@@ -411,13 +512,13 @@ def insert_risks_paragraphs(paragraph, content: str):
     
     if not parsed:
         return
-    
-    # Clear the original paragraph
-    paragraph.clear()
-    
+
+    # Clear runs but preserve paragraph properties (style, justification, etc.)
+    clear_paragraph_content(paragraph)
+
     current_para = paragraph
     first_content = True
-    
+
     for item in parsed:
         if item.get("type") == "blank":
             # Create blank paragraph for spacing
@@ -667,17 +768,108 @@ def replace_placeholders_in_table(table, placeholders: Dict[str, str], images: D
     return modified
 
 
+def fix_malformed_xml(doc_bytes: bytes) -> bytes:
+    """
+    Post-processing safety net: remove <w:pStyle> and <w:rStyle> elements
+    that are missing the required w:val attribute.
+
+    A <w:pStyle/> without w:val is invalid OOXML and causes Pages (and
+    other strict parsers) to reject the file.  Removing the element is
+    safe — the paragraph simply inherits the default ("Normal") style.
+    """
+    input_buf = BytesIO(doc_bytes)
+    output_buf = BytesIO()
+
+    with zipfile.ZipFile(input_buf, "r") as zin:
+        with zipfile.ZipFile(output_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+
+                fname = item.filename.lower()
+                if fname.startswith("word/") and fname.endswith(".xml"):
+                    xml_text = data.decode("utf-8")
+
+                    # Remove self-closing <w:pStyle .../> without w:val
+                    xml_text = re.sub(
+                        r'<w:pStyle\b(?![^>]*\bw:val=)[^>]*/>', '', xml_text
+                    )
+                    # Remove open+close <w:pStyle ...>...</w:pStyle> without w:val
+                    xml_text = re.sub(
+                        r'<w:pStyle\b(?![^>]*\bw:val=)[^>]*>\s*</w:pStyle>', '', xml_text
+                    )
+                    # Same for <w:rStyle>
+                    xml_text = re.sub(
+                        r'<w:rStyle\b(?![^>]*\bw:val=)[^>]*/>', '', xml_text
+                    )
+                    xml_text = re.sub(
+                        r'<w:rStyle\b(?![^>]*\bw:val=)[^>]*>\s*</w:rStyle>', '', xml_text
+                    )
+
+                    data = xml_text.encode("utf-8")
+
+                zout.writestr(item, data)
+
+    output_buf.seek(0)
+    return output_buf.getvalue()
+
+
+def normalize_fonts_to_arial(doc_bytes: bytes) -> bytes:
+    """
+    Post-processing: scan all <w:rFonts> elements in word/*.xml and
+    replace non-Arial font references with Arial.
+
+    - Times New Roman  → w:ascii="Arial" w:hAnsi="Arial"
+    - Segoe UI         → w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"
+    - Already Arial    → untouched
+    """
+    input_buf = BytesIO(doc_bytes)
+    output_buf = BytesIO()
+
+    def _fix_rfonts(match):
+        tag = match.group(0)
+        ascii_attr = re.search(r'w:ascii="([^"]*)"', tag)
+        if not ascii_attr:
+            return tag
+        font = ascii_attr.group(1)
+        if font == "Arial":
+            return tag
+        if font == "Times New Roman":
+            tag = re.sub(r'w:ascii="Times New Roman"', 'w:ascii="Arial"', tag)
+            tag = re.sub(r'w:hAnsi="Times New Roman"', 'w:hAnsi="Arial"', tag)
+            return tag
+        if font == "Segoe UI":
+            tag = re.sub(r'w:ascii="Segoe UI"', 'w:ascii="Arial"', tag)
+            tag = re.sub(r'w:hAnsi="Segoe UI"', 'w:hAnsi="Arial"', tag)
+            tag = re.sub(r'w:cs="Segoe UI"', 'w:cs="Arial"', tag)
+            return tag
+        return tag
+
+    with zipfile.ZipFile(input_buf, "r") as zin:
+        with zipfile.ZipFile(output_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                fname = item.filename.lower()
+                if fname.startswith("word/") and fname.endswith(".xml"):
+                    xml_text = data.decode("utf-8")
+                    xml_text = re.sub(r'<w:rFonts\b[^>]*>', _fix_rfonts, xml_text)
+                    data = xml_text.encode("utf-8")
+                zout.writestr(item, data)
+
+    output_buf.seek(0)
+    return output_buf.getvalue()
+
+
 def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: Dict[str, str]) -> bytes:
     """Fill the template with placeholders and images."""
     doc = Document(BytesIO(template_bytes))
-    
+
     # Process main document paragraphs
     process_paragraphs(doc.paragraphs, placeholders, images)
-    
+
     # Process tables
     for table in doc.tables:
         replace_placeholders_in_table(table, placeholders, images)
-    
+
     # Process headers and footers for all section types
     for section in doc.sections:
         # Process different header types
@@ -686,31 +878,43 @@ def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: D
                 process_paragraphs(header.paragraphs, placeholders, images)
                 for table in header.tables:
                     replace_placeholders_in_table(table, placeholders, images)
-        
+
         # Process different footer types
         for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
             if footer:
                 process_paragraphs(footer.paragraphs, placeholders, images)
                 for table in footer.tables:
                     replace_placeholders_in_table(table, placeholders, images)
-    
+
     # Save to bytes
     output = BytesIO()
     doc.save(output)
     output.seek(0)
-    return output.getvalue()
+    doc_bytes = output.getvalue()
+
+    # Post-process: fix any malformed style elements from python-docx round-trip
+    doc_bytes = fix_malformed_xml(doc_bytes)
+
+    # Normalize all fonts to Arial
+    doc_bytes = normalize_fonts_to_arial(doc_bytes)
+
+    return doc_bytes
 
 
 @app.post("/fill")
 async def fill_template_endpoint(request: FillRequest):
     """Fill template and return as download."""
-    # Download template
     template_bytes = download_template(request.template_key)
-    
-    # Fill template
-    filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
-    
-    # Return as download
+
+    if is_term_sheet_template(request.template_key):
+        filled_bytes = fill_term_sheet(template_bytes, request.placeholders)
+    else:
+        filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
+
+    remaining = validate_fill_result(filled_bytes)
+    if remaining:
+        print(f"Warning: unfilled placeholders remain: {remaining}")
+
     return StreamingResponse(
         BytesIO(filled_bytes),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -721,23 +925,25 @@ async def fill_template_endpoint(request: FillRequest):
 @app.post("/fill-and-upload")
 async def fill_and_upload_endpoint(request: FillAndUploadRequest):
     """Fill template and upload to S3."""
-    # Download template
     template_bytes = download_template(request.template_key)
-    
-    # Fill template
-    filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
-    
-    # Get unique filename if original exists
+
+    if is_term_sheet_template(request.template_key):
+        filled_bytes = fill_term_sheet(template_bytes, request.placeholders)
+    else:
+        filled_bytes = fill_template(template_bytes, request.placeholders, request.images)
+
+    remaining = validate_fill_result(filled_bytes)
+    if remaining:
+        print(f"Warning: unfilled placeholders remain: {remaining}")
+
     output_key = get_unique_output_key(s3_client, S3_BUCKET, request.output_key)
-    
-    # Upload to S3
     output_url = upload_to_s3(filled_bytes, output_key)
-    
+
     return {
         "success": True,
-        "output_key": output_key,  # Return actual filename used
+        "output_key": output_key,
         "output_url": output_url,
-        "original_key": request.output_key  # Also return what was requested
+        "original_key": request.output_key,
     }
 
 
