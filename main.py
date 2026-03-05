@@ -254,6 +254,9 @@ def fill_term_sheet(template_bytes: bytes, placeholders: Dict[str, str]) -> byte
     # Normalize all fonts to Arial
     doc_bytes = normalize_fonts_to_arial(doc_bytes)
 
+    # Highlight runs containing sentinel text (e.g. "[MISSING — FILL IN]")
+    doc_bytes = highlight_missing_placeholders(doc_bytes)
+
     return doc_bytes
 
 
@@ -859,6 +862,56 @@ def normalize_fonts_to_arial(doc_bytes: bytes) -> bytes:
     return output_buf.getvalue()
 
 
+def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING") -> bytes:
+    """
+    Post-processing: add yellow highlight to any <w:r> run whose <w:t>
+    text starts with *sentinel* (default "[MISSING").
+
+    Runs that already carry a <w:highlight> element are left alone.
+    """
+    escaped_sentinel = xml_escape(sentinel)
+    input_buf = BytesIO(doc_bytes)
+    output_buf = BytesIO()
+
+    HIGHLIGHT_EL = '<w:highlight w:val="yellow"/>'
+
+    # Match a complete <w:r>…</w:r> block (non-greedy, DOTALL)
+    RUN_RE = re.compile(r'<w:r\b[^>]*>(?:(?!</w:r>).)*?</w:r>', re.DOTALL)
+
+    def _maybe_highlight(match):
+        run_xml = match.group(0)
+
+        # Only runs whose <w:t> text contains the sentinel
+        t_texts = re.findall(r'<w:t[^>]*>([^<]*)</w:t>', run_xml)
+        combined = "".join(t_texts)
+        if escaped_sentinel not in combined:
+            return run_xml
+
+        # Already highlighted — leave alone
+        if 'w:highlight' in run_xml:
+            return run_xml
+
+        # Inject highlight into existing <w:rPr>, or create one
+        if '<w:rPr>' in run_xml:
+            return run_xml.replace('<w:rPr>', f'<w:rPr>{HIGHLIGHT_EL}', 1)
+        else:
+            return run_xml.replace('<w:r>', f'<w:r><w:rPr>{HIGHLIGHT_EL}</w:rPr>', 1)
+
+    with zipfile.ZipFile(input_buf, "r") as zin:
+        with zipfile.ZipFile(output_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                fname = item.filename.lower()
+                if fname.startswith("word/") and fname.endswith(".xml"):
+                    xml_text = data.decode("utf-8")
+                    xml_text = RUN_RE.sub(_maybe_highlight, xml_text)
+                    data = xml_text.encode("utf-8")
+                zout.writestr(item, data)
+
+    output_buf.seek(0)
+    return output_buf.getvalue()
+
+
 def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: Dict[str, str]) -> bytes:
     """Fill the template with placeholders and images."""
     doc = Document(BytesIO(template_bytes))
@@ -897,6 +950,9 @@ def fill_template(template_bytes: bytes, placeholders: Dict[str, str], images: D
 
     # Normalize all fonts to Arial
     doc_bytes = normalize_fonts_to_arial(doc_bytes)
+
+    # Highlight runs containing sentinel text (e.g. "[MISSING — FILL IN]")
+    doc_bytes = highlight_missing_placeholders(doc_bytes)
 
     return doc_bytes
 
