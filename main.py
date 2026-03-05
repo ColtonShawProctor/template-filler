@@ -909,6 +909,10 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
     RPR_BLOCK_RE = re.compile(r'<w:rPr\b[^>]*>.*?</w:rPr>', re.DOTALL)
     # Sentinel pattern: [MISSING …] (greedy up to the closing bracket)
     SENTINEL_RE = re.compile(re.escape(escaped_sentinel) + r'[^\]]*\]')
+    # Matches any child element inside a run's content area (after rPr):
+    # <w:t> text elements (g1=attrs, g2=text) or self-closing elements
+    # like <w:tab/>, <w:br/>, <w:sym/>, <w:cr/> (groups are None).
+    RUN_CHILD_RE = re.compile(r'<w:t([^>]*)>([^<]*)</w:t>|<[^>]+/>')
 
     def _extract_rpr(run_body: str) -> str:
         """Return the full <w:rPr>…</w:rPr> block from a run, or ''."""
@@ -925,13 +929,6 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
                 return rpr_xml[:m.end()] + HIGHLIGHT_EL + rpr_xml[m.end():]
         # No existing rPr — build a minimal one
         return '<w:rPr>' + HIGHLIGHT_EL + '</w:rPr>'
-
-    def _build_run(open_tag: str, rpr_xml: str, t_attrs: str, text: str,
-                   leading_extra: str = '', trailing_extra: str = '') -> str:
-        """Assemble a single <w:r>…</w:r> from parts, preserving non-text
-        sibling elements (e.g. <w:tab/>, <w:br/>) via leading/trailing."""
-        return (f'{open_tag}{rpr_xml}{leading_extra}'
-                f'<w:t{t_attrs}>{text}</w:t>{trailing_extra}</w:r>')
 
     def _process_paragraph(para_xml: str) -> str:
         """Process runs inside a single paragraph."""
@@ -998,13 +995,15 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
                 continue
 
             # --- Slow path: multiple fragments → rebuild sibling runs ---
-            # Extract reusable parts of the original run
+            # Parse the original run's children in document order so that
+            # non-text elements (<w:tab/>, <w:br/>, etc.) end up in the
+            # correct split run based on their actual position, not lumped
+            # into a leading/trailing bucket.
             open_tag_end = run_body.find('>') + 1
             open_tag = run_body[:open_tag_end]
             orig_rpr = _extract_rpr(run_body)
             hl_rpr = _rpr_with_highlight(orig_rpr)
 
-            # <w:t> attributes (e.g. xml:space="preserve")
             t_attrs = t_matches[0].group(2) if t_matches else ''
             if t_attrs and not t_attrs.startswith(' '):
                 t_attrs = ' ' + t_attrs
@@ -1012,40 +1011,70 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
                           if ' xml:space=' in t_attrs or len(fragments) > 1
                           else t_attrs)
 
-            # Preserve ALL non-text sibling elements (<w:tab/>, <w:br/>,
-            # <w:sym/>, etc.).  Collect from three regions:
-            #   1. Between <w:rPr> and the first <w:t>
-            #   2. Between consecutive <w:t>…</w:t> elements
-            #   3. After the last </w:t>
-            # Regions 1+2 → leading (first split run),
-            # Region 3   → trailing (last split run).
+            # 1. Parse children after rPr in document order, tracking each
+            #    child's position in the combined text stream.
             rpr_end = (run_body.find(orig_rpr) + len(orig_rpr)
                        if orig_rpr else open_tag_end)
-            first_t = run_body.find('<w:t')
+            children = []       # ordered: {type, ...}
+            text_cursor = 0
+            for cm in RUN_CHILD_RE.finditer(run_body[rpr_end:]):
+                if cm.group(2) is not None:          # <w:t> element
+                    txt = cm.group(2)
+                    children.append({
+                        'type': 'text', 'content': txt,
+                        'start': text_cursor,
+                        'end': text_cursor + len(txt),
+                    })
+                    text_cursor += len(txt)
+                else:                                 # non-text element
+                    children.append({
+                        'type': 'other', 'xml': cm.group(0),
+                        'text_pos': text_cursor,
+                    })
 
-            leading_parts = []
-            if first_t > rpr_end:
-                leading_parts.append(run_body[rpr_end:first_t])
-            for j in range(len(t_matches) - 1):
-                gap = run_body[t_matches[j].end():t_matches[j + 1].start()]
-                if gap.strip():
-                    leading_parts.append(gap)
-            leading_extra = ''.join(leading_parts)
-
-            last_t_close = run_body.rfind('</w:t>')
-            trailing_extra = (run_body[last_t_close + len('</w:t>'):]
-                              if last_t_close != -1 else '')
-
-            # Rebuild sibling <w:r> elements — attach non-text elements
-            # to the first / last fragment so they stay in position.
-            new_runs = []
+            # 2. Build character ranges for each live fragment.
             live_fragments = [(t, h) for t, h in fragments if t]
-            for idx, (text, highlighted) in enumerate(live_fragments):
-                rpr = hl_rpr if highlighted else orig_rpr
-                lead = leading_extra if idx == 0 else ''
-                trail = trailing_extra if idx == len(live_fragments) - 1 else ''
-                new_runs.append(_build_run(open_tag, rpr, space_attr, text,
-                                           lead, trail))
+            frag_ranges = []
+            fpos = 0
+            for ft, fh in live_fragments:
+                frag_ranges.append((fpos, fpos + len(ft), fh))
+                fpos += len(ft)
+
+            # 3. Distribute children across fragments by position.
+            frag_children = [[] for _ in frag_ranges]
+            for child in children:
+                if child['type'] == 'text':
+                    # A text child may span a fragment boundary — slice it.
+                    for fi, (fs, fe, _fh) in enumerate(frag_ranges):
+                        ov_s = max(child['start'], fs)
+                        ov_e = min(child['end'], fe)
+                        if ov_s < ov_e:
+                            portion = child['content'][
+                                ov_s - child['start']:ov_e - child['start']]
+                            frag_children[fi].append(('text', portion))
+                else:
+                    # Non-text child: assign to the fragment that owns the
+                    # text immediately before this element's position.
+                    tp = child['text_pos']
+                    owner = 0
+                    if tp > 0:
+                        for fi, (fs, fe, _fh) in enumerate(frag_ranges):
+                            if fs <= tp - 1 < fe:
+                                owner = fi
+                                break
+                    frag_children[owner].append(('other', child['xml']))
+
+            # 4. Rebuild split <w:r> elements preserving document order.
+            new_runs = []
+            for fi, (fs, fe, fh) in enumerate(frag_ranges):
+                rpr = hl_rpr if fh else orig_rpr
+                inner = ''
+                for ctype, cdata in frag_children[fi]:
+                    if ctype == 'text':
+                        inner += f'<w:t{space_attr}>{cdata}</w:t>'
+                    else:
+                        inner += cdata
+                new_runs.append(f'{open_tag}{rpr}{inner}</w:r>')
 
             # Replace: everything from run_start onward becomes the new runs
             # (minus the trailing </w:r> which the split/join will re-add).
