@@ -926,9 +926,12 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
         # No existing rPr — build a minimal one
         return '<w:rPr>' + HIGHLIGHT_EL + '</w:rPr>'
 
-    def _build_run(open_tag: str, rpr_xml: str, t_attrs: str, text: str) -> str:
-        """Assemble a single <w:r>…</w:r> from parts."""
-        return f'{open_tag}{rpr_xml}<w:t{t_attrs}>{text}</w:t></w:r>'
+    def _build_run(open_tag: str, rpr_xml: str, t_attrs: str, text: str,
+                   leading_extra: str = '', trailing_extra: str = '') -> str:
+        """Assemble a single <w:r>…</w:r> from parts, preserving non-text
+        sibling elements (e.g. <w:tab/>, <w:br/>) via leading/trailing."""
+        return (f'{open_tag}{rpr_xml}{leading_extra}'
+                f'<w:t{t_attrs}>{text}</w:t>{trailing_extra}</w:r>')
 
     def _process_paragraph(para_xml: str) -> str:
         """Process runs inside a single paragraph."""
@@ -948,25 +951,18 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
             t_matches = list(T_ELEMENT_RE.finditer(run_body))
             combined_text = ''.join(m.group(3) for m in t_matches)
 
+            # Whitespace / tab-only runs must never be touched.
+            # Covers literal \t, &#9;, &#x9;, and space-only runs.
+            stripped = combined_text.replace('&#9;', '').replace('&#x9;', '').strip()
+            if not stripped:
+                continue
+
             if escaped_sentinel not in combined_text:
                 continue
 
             # Already highlighted — skip
             if 'w:highlight' in run_body:
                 continue
-
-            # --- Extract reusable parts of the original run ---
-            # Opening <w:r …> tag (may have attributes like w:rsidR)
-            open_tag_end = run_body.find('>') + 1
-            open_tag = run_body[:open_tag_end]
-            # Original <w:rPr> block (without highlight)
-            orig_rpr = _extract_rpr(run_body)
-            # Highlighted version
-            hl_rpr = _rpr_with_highlight(orig_rpr)
-            # <w:t> attributes (e.g. xml:space="preserve")
-            t_attrs = t_matches[0].group(2) if t_matches else ''
-            if t_attrs and not t_attrs.startswith(' '):
-                t_attrs = ' ' + t_attrs
 
             # --- Split the text around every sentinel occurrence ---
             fragments = []  # list of (text, highlighted: bool)
@@ -984,22 +980,76 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
             if not any(hl for _, hl in fragments):
                 fragments = [(combined_text, True)]
 
-            # Preserve space attr on outer fragments
-            space_attr = ' xml:space="preserve"' if ' xml:space=' in t_attrs or len(fragments) > 1 else t_attrs
+            # --- Fast path: single fragment → inject highlight in-place ---
+            # This preserves every element in the run (<w:tab/>, <w:br/>, etc.)
+            # and only touches <w:rPr>.
+            if len(fragments) == 1 and fragments[0][1]:
+                rpr_m = RPR_OPEN_RE.search(run_body)
+                if rpr_m:
+                    inject_at = run_start + rpr_m.end()
+                    run_chunks[i] = (chunk[:inject_at]
+                                     + HIGHLIGHT_EL
+                                     + chunk[inject_at:])
+                else:
+                    open_end = chunk.find('>', run_start) + 1
+                    run_chunks[i] = (chunk[:open_end]
+                                     + '<w:rPr>' + HIGHLIGHT_EL + '</w:rPr>'
+                                     + chunk[open_end:])
+                continue
 
-            # --- Rebuild sibling <w:r> elements ---
+            # --- Slow path: multiple fragments → rebuild sibling runs ---
+            # Extract reusable parts of the original run
+            open_tag_end = run_body.find('>') + 1
+            open_tag = run_body[:open_tag_end]
+            orig_rpr = _extract_rpr(run_body)
+            hl_rpr = _rpr_with_highlight(orig_rpr)
+
+            # <w:t> attributes (e.g. xml:space="preserve")
+            t_attrs = t_matches[0].group(2) if t_matches else ''
+            if t_attrs and not t_attrs.startswith(' '):
+                t_attrs = ' ' + t_attrs
+            space_attr = (' xml:space="preserve"'
+                          if ' xml:space=' in t_attrs or len(fragments) > 1
+                          else t_attrs)
+
+            # Preserve ALL non-text sibling elements (<w:tab/>, <w:br/>,
+            # <w:sym/>, etc.).  Collect from three regions:
+            #   1. Between <w:rPr> and the first <w:t>
+            #   2. Between consecutive <w:t>…</w:t> elements
+            #   3. After the last </w:t>
+            # Regions 1+2 → leading (first split run),
+            # Region 3   → trailing (last split run).
+            rpr_end = (run_body.find(orig_rpr) + len(orig_rpr)
+                       if orig_rpr else open_tag_end)
+            first_t = run_body.find('<w:t')
+
+            leading_parts = []
+            if first_t > rpr_end:
+                leading_parts.append(run_body[rpr_end:first_t])
+            for j in range(len(t_matches) - 1):
+                gap = run_body[t_matches[j].end():t_matches[j + 1].start()]
+                if gap.strip():
+                    leading_parts.append(gap)
+            leading_extra = ''.join(leading_parts)
+
+            last_t_close = run_body.rfind('</w:t>')
+            trailing_extra = (run_body[last_t_close + len('</w:t>'):]
+                              if last_t_close != -1 else '')
+
+            # Rebuild sibling <w:r> elements — attach non-text elements
+            # to the first / last fragment so they stay in position.
             new_runs = []
-            for text, highlighted in fragments:
-                if not text:
-                    continue
+            live_fragments = [(t, h) for t, h in fragments if t]
+            for idx, (text, highlighted) in enumerate(live_fragments):
                 rpr = hl_rpr if highlighted else orig_rpr
-                new_runs.append(_build_run(open_tag, rpr, space_attr, text))
+                lead = leading_extra if idx == 0 else ''
+                trail = trailing_extra if idx == len(live_fragments) - 1 else ''
+                new_runs.append(_build_run(open_tag, rpr, space_attr, text,
+                                           lead, trail))
 
-            # Replace: everything from run_start to end of chunk becomes
-            # the new runs (minus the trailing </w:r> which the join adds).
+            # Replace: everything from run_start onward becomes the new runs
+            # (minus the trailing </w:r> which the split/join will re-add).
             prefix = chunk[:run_start]
-            # new_runs already contain their own </w:r> closers.
-            # Remove the last </w:r> because the split/join will re-add it.
             combined_runs = ''.join(new_runs)
             if combined_runs.endswith('</w:r>'):
                 combined_runs = combined_runs[:-len('</w:r>')]
