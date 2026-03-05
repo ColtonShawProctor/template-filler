@@ -864,11 +864,19 @@ def normalize_fonts_to_arial(doc_bytes: bytes) -> bytes:
 
 def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING") -> bytes:
     """
-    Post-processing: add yellow highlight to any <w:r> run whose <w:t>
-    text contains *sentinel* (default "[MISSING").
+    Post-processing: add yellow highlight **only** to the exact portion
+    of text that matches a ``[MISSING …]`` sentinel.
 
-    Runs that already carry a <w:highlight> element are left alone.
-    Neighbouring runs are never touched.
+    Processing is scoped paragraph-by-paragraph (split on ``</w:p>``) so
+    matches can never bleed across paragraph boundaries.  Within each
+    paragraph, runs are isolated via ``</w:r>`` splitting.
+
+    When a sentinel appears mid-sentence inside a larger run, the run is
+    split into up to three sibling ``<w:r>`` elements — only the sentinel
+    fragment receives the highlight; the surrounding text keeps the
+    original formatting untouched.
+
+    Runs that already carry a ``<w:highlight>`` element are skipped.
     """
     escaped_sentinel = xml_escape(sentinel)
     input_buf = BytesIO(doc_bytes)
@@ -876,50 +884,120 @@ def highlight_missing_placeholders(doc_bytes: bytes, sentinel: str = "[MISSING")
 
     HIGHLIGHT_EL = '<w:highlight w:val="yellow"/>'
 
-    # Matches <w:r> or <w:r  (with attrs) but NOT <w:rPr>, <w:rFonts>, etc.
+    # Matches <w:r> / <w:r … > but NOT <w:rPr>, <w:rFonts>, etc.
     RUN_OPEN_RE = re.compile(r'<w:r[\s>]')
-    T_CONTENT_RE = re.compile(r'<w:t[^>]*>([^<]*)</w:t>')
+    # Captures the full <w:t …>text</w:t> element (tag + content)
+    T_ELEMENT_RE = re.compile(r'(<w:t([^>]*)>)([^<]*)(</w:t>)')
     RPR_OPEN_RE = re.compile(r'<w:rPr\b[^>]*>')
+    # Captures entire <w:rPr>…</w:rPr> block
+    RPR_BLOCK_RE = re.compile(r'<w:rPr\b[^>]*>.*?</w:rPr>', re.DOTALL)
+    # Sentinel pattern: [MISSING …] (greedy up to the closing bracket)
+    SENTINEL_RE = re.compile(re.escape(escaped_sentinel) + r'[^\]]*\]')
 
-    def _process_xml(xml_text):
-        # Split on </w:r> so each chunk[i] + '</w:r>' is one run's content.
-        # This structurally isolates runs — no regex can overreach.
-        chunks = xml_text.split('</w:r>')
+    def _extract_rpr(run_body: str) -> str:
+        """Return the full <w:rPr>…</w:rPr> block from a run, or ''."""
+        m = RPR_BLOCK_RE.search(run_body)
+        return m.group(0) if m else ''
 
-        for i in range(len(chunks) - 1):  # last chunk has no closing </w:r>
-            chunk = chunks[i]
+    def _rpr_with_highlight(rpr_xml: str) -> str:
+        """Return rPr XML with <w:highlight> injected (idempotent)."""
+        if 'w:highlight' in rpr_xml:
+            return rpr_xml
+        if rpr_xml:
+            m = RPR_OPEN_RE.search(rpr_xml)
+            if m:
+                return rpr_xml[:m.end()] + HIGHLIGHT_EL + rpr_xml[m.end():]
+        # No existing rPr — build a minimal one
+        return '<w:rPr>' + HIGHLIGHT_EL + '</w:rPr>'
 
-            # Locate the last <w:r ...> opening tag in this chunk
+    def _build_run(open_tag: str, rpr_xml: str, t_attrs: str, text: str) -> str:
+        """Assemble a single <w:r>…</w:r> from parts."""
+        return f'{open_tag}{rpr_xml}<w:t{t_attrs}>{text}</w:t></w:r>'
+
+    def _process_paragraph(para_xml: str) -> str:
+        """Process runs inside a single paragraph."""
+        run_chunks = para_xml.split('</w:r>')
+
+        for i in range(len(run_chunks) - 1):
+            chunk = run_chunks[i]
+
+            # Locate the last <w:r …> opening tag in this chunk
             opens = list(RUN_OPEN_RE.finditer(chunk))
             if not opens:
                 continue
             run_start = opens[-1].start()
             run_body = chunk[run_start:]
 
-            # Only act when <w:t> text contains the sentinel
-            if not any(escaped_sentinel in t
-                       for t in T_CONTENT_RE.findall(run_body)):
+            # Concatenate all <w:t> text in this run
+            t_matches = list(T_ELEMENT_RE.finditer(run_body))
+            combined_text = ''.join(m.group(3) for m in t_matches)
+
+            if escaped_sentinel not in combined_text:
                 continue
 
             # Already highlighted — skip
             if 'w:highlight' in run_body:
                 continue
 
-            # Inject <w:highlight> into the run's <w:rPr>
-            rpr_m = RPR_OPEN_RE.search(run_body)
-            if rpr_m:
-                inject_at = run_start + rpr_m.end()
-                chunks[i] = (chunk[:inject_at]
-                             + HIGHLIGHT_EL
-                             + chunk[inject_at:])
-            else:
-                # No <w:rPr> — create one right after the <w:r...> opening tag
-                open_end = chunk.find('>', run_start) + 1
-                chunks[i] = (chunk[:open_end]
-                             + '<w:rPr>' + HIGHLIGHT_EL + '</w:rPr>'
-                             + chunk[open_end:])
+            # --- Extract reusable parts of the original run ---
+            # Opening <w:r …> tag (may have attributes like w:rsidR)
+            open_tag_end = run_body.find('>') + 1
+            open_tag = run_body[:open_tag_end]
+            # Original <w:rPr> block (without highlight)
+            orig_rpr = _extract_rpr(run_body)
+            # Highlighted version
+            hl_rpr = _rpr_with_highlight(orig_rpr)
+            # <w:t> attributes (e.g. xml:space="preserve")
+            t_attrs = t_matches[0].group(2) if t_matches else ''
+            if t_attrs and not t_attrs.startswith(' '):
+                t_attrs = ' ' + t_attrs
 
-        return '</w:r>'.join(chunks)
+            # --- Split the text around every sentinel occurrence ---
+            fragments = []  # list of (text, highlighted: bool)
+            pos = 0
+            for sm in SENTINEL_RE.finditer(combined_text):
+                if sm.start() > pos:
+                    fragments.append((combined_text[pos:sm.start()], False))
+                fragments.append((sm.group(0), True))
+                pos = sm.end()
+            if pos < len(combined_text):
+                fragments.append((combined_text[pos:], False))
+
+            # If no sentinel regex matched (malformed sentinel without
+            # closing ']'), fall back to highlighting the whole run.
+            if not any(hl for _, hl in fragments):
+                fragments = [(combined_text, True)]
+
+            # Preserve space attr on outer fragments
+            space_attr = ' xml:space="preserve"' if ' xml:space=' in t_attrs or len(fragments) > 1 else t_attrs
+
+            # --- Rebuild sibling <w:r> elements ---
+            new_runs = []
+            for text, highlighted in fragments:
+                if not text:
+                    continue
+                rpr = hl_rpr if highlighted else orig_rpr
+                new_runs.append(_build_run(open_tag, rpr, space_attr, text))
+
+            # Replace: everything from run_start to end of chunk becomes
+            # the new runs (minus the trailing </w:r> which the join adds).
+            prefix = chunk[:run_start]
+            # new_runs already contain their own </w:r> closers.
+            # Remove the last </w:r> because the split/join will re-add it.
+            combined_runs = ''.join(new_runs)
+            if combined_runs.endswith('</w:r>'):
+                combined_runs = combined_runs[:-len('</w:r>')]
+            run_chunks[i] = prefix + combined_runs
+
+        return '</w:r>'.join(run_chunks)
+
+    def _process_xml(xml_text: str) -> str:
+        # Split on </w:p> to scope processing per paragraph.
+        para_chunks = xml_text.split('</w:p>')
+        for i in range(len(para_chunks) - 1):
+            if escaped_sentinel in para_chunks[i]:
+                para_chunks[i] = _process_paragraph(para_chunks[i])
+        return '</w:p>'.join(para_chunks)
 
     with zipfile.ZipFile(input_buf, "r") as zin:
         with zipfile.ZipFile(output_buf, "w", zipfile.ZIP_DEFLATED) as zout:
