@@ -248,6 +248,14 @@ def fill_term_sheet(template_bytes: bytes, placeholders: Dict[str, str]) -> byte
                             if value.startswith("[MISSING"):
                                 xml_text = xml_text.replace(':' + token, ':' + ' ' + escaped)
                             xml_text = xml_text.replace(token, escaped)
+                    # Ensure <w:t> elements with leading/trailing spaces
+                    # have xml:space="preserve" so parsers keep the whitespace.
+                    def _add_space_preserve(m):
+                        attrs, text = m.group(1), m.group(2)
+                        if (text.startswith(' ') or text.endswith(' ')) and 'xml:space' not in attrs:
+                            return f'<w:t{attrs} xml:space="preserve">{text}</w:t>'
+                        return m.group(0)
+                    xml_text = re.sub(r'<w:t([^>]*)>([^<]*)</w:t>', _add_space_preserve, xml_text)
                     data = xml_text.encode("utf-8")
 
                 zout.writestr(item, data)
